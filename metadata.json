@@ -1,0 +1,6 @@
+{
+  "name": "Teams2Jira AI - Resúmenes Inteligentes y Sincronización Jira",
+  "description": "Plataforma de IA para procesar transcripciones de Microsoft Teams, estructurar compromisos por participante, sincronizar tickets en Jira y dar seguimiento mensual a temas.",
+  "requestFramePermissions": [],
+  "majorCapabilities": ["MAJOR_CAPABILITY_SERVER_SIDE_GEMINI_API"]
+}

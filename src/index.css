@@ -1,0 +1,58 @@
+@import "tailwindcss";
+
+@layer base {
+  body {
+    font-family: 'Montserrat', sans-serif;
+  }
+  
+  h1, h2, h3, h4, h5, h6 {
+    font-family: 'Lato', sans-serif;
+  }
+}
+
+:root {
+  --civica-orange: #FF5038;
+  --civica-amber: #EE880E;
+  --civica-dark: #333333;
+  --civica-purple: #9B51E0;
+  --civica-green: #29E78C;
+  --civica-cyan: #61BFED;
+  --civica-gold: #FFAD32;
+  --civica-gray: #BDBDBD;
+}
+
+.bg-civica-gradient {
+  background: linear-gradient(135deg, #FF5038 0%, #EE880E 87%);
+}
+
+.text-civica-gradient {
+  background: linear-gradient(135deg, #FF5038 0%, #EE880E 87%);
+  -webkit-background-clip: text;
+  -webkit-text-fill-color: transparent;
+}
+
+@media print {
+  body {
+    background-color: #ffffff !important;
+    color: #0f172a !important;
+  }
+  
+  header, footer, nav, button, .print\:hidden {
+    display: none !important;
+  }
+  
+  #printable-report {
+    background: transparent !important;
+    color: #0f172a !important;
+    border: none !important;
+    box-shadow: none !important;
+    padding: 0 !important;
+  }
+  
+  #printable-report * {
+    color: #0f172a !important;
+    background-color: transparent !important;
+    border-color: #e2e8f0 !important;
+  }
+}
+

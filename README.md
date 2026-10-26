@@ -213,7 +213,7 @@ El framework permite configurar los modelos disponibles por defecto para toda la
 
 ```env
 # Lista de identificadores técnicos separados por coma
-FACTORY_MODELS_GEMINI="gemini-3.8-flash,gemini-2.5-flash,gemini-2.5-pro,gemini-1.5-flash,gemini-3.1-flash-lite"
+FACTORY_MODELS_GEMINI="gemini-3.8-flash,gemini-2.5-flash,gemini-2.5-pro,gemini-1.5-flash"
 FACTORY_MODELS_CLAUDE="claude-3-7-sonnet-20250219,claude-3-5-sonnet-20241022,claude-3-5-haiku-20241022"
 FACTORY_MODELS_OPENAI="gpt-4o,gpt-4o-mini,o3-mini"
 FACTORY_MODELS_COPILOT="copilot-gpt-4o,copilot-gpt-4o-mini"
@@ -361,7 +361,7 @@ AZURE_OPENAI_API_VERSION="2024-08-01-preview"
 # MODELOS DE FÁBRICA / DEFAULT POR PROVEEDOR (Configurables)
 # Lista de identificadores técnicos separados por coma
 # ============================================================================
-FACTORY_MODELS_GEMINI="gemini-3.8-flash,gemini-2.5-flash,gemini-2.5-pro,gemini-1.5-flash,gemini-3.1-flash-lite"
+FACTORY_MODELS_GEMINI="gemini-3.8-flash,gemini-2.5-flash,gemini-2.5-pro,gemini-1.5-flash"
 FACTORY_MODELS_CLAUDE="claude-3-7-sonnet-20250219,claude-3-5-sonnet-20241022,claude-3-5-haiku-20241022"
 FACTORY_MODELS_OPENAI="gpt-4o,gpt-4o-mini,o3-mini"
 FACTORY_MODELS_COPILOT="copilot-gpt-4o,copilot-gpt-4o-mini"

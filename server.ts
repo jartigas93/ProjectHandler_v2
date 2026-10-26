@@ -78,10 +78,10 @@ function parseEnvModelList(envVal: string | undefined, defaultList: string[]): s
 // Endpoint: Configurable Factory Models from .env
 app.get('/api/ai/models', (_req: Request, res: Response) => {
   const geminiList = parseEnvModelList(process.env.FACTORY_MODELS_GEMINI, [
+    'gemini-3.8-flash',
     'gemini-2.5-flash',
     'gemini-2.5-pro',
     'gemini-1.5-flash',
-    'gemini-3.1-flash-lite',
   ]);
   const claudeList = parseEnvModelList(process.env.FACTORY_MODELS_CLAUDE, [
     'claude-3-7-sonnet-20250219',
@@ -125,7 +125,7 @@ app.get('/api/ai/models', (_req: Request, res: Response) => {
   res.json({
     factoryModels,
     defaults: {
-      gemini: geminiList[0] || 'gemini-2.5-flash',
+      gemini: geminiList[0] || 'gemini-3.8-flash',
       claude: claudeList[0] || 'claude-3-7-sonnet-20250219',
       openai: openaiList[0] || 'gpt-4o',
       copilot: copilotList[0] || 'copilot-gpt-4o',
@@ -178,7 +178,7 @@ function describeAiError(err: any, provider: string, model?: string): {
       const inner = parsed?.error || parsed;
       if (inner?.message) message = String(inner.message);
       if (status === null && typeof inner?.code === 'number') status = inner.code;
-    } catch {}
+    } catch { }
   }
 
   if (err instanceof SyntaxError) {
@@ -344,7 +344,7 @@ async function callAIProvider(params: AICallParams): Promise<string> {
     },
   });
 
-  const targetModel = model?.trim() || 'gemini-2.5-flash';
+  const targetModel = model?.trim() || 'gemini-3.8-flash';
   const response = await geminiInstance.models.generateContent({
     model: targetModel,
     contents: `${systemInstruction}\n\n${promptContent}\n\nResponde ÚNICAMENTE con el objeto JSON válido.`,
@@ -364,7 +364,7 @@ app.post('/api/ai/test-connection', async (req: Request, res: Response) => {
   try {
     const rawResult = await callAIProvider({
       provider,
-      model: model || (provider === 'claude' ? 'claude-3-7-sonnet-20250219' : provider === 'openai' ? 'gpt-4o' : provider === 'copilot' ? 'copilot-gpt-4o' : 'gemini-2.5-flash'),
+      model: model || (provider === 'claude' ? 'claude-3-7-sonnet-20250219' : provider === 'openai' ? 'gpt-4o' : provider === 'copilot' ? 'copilot-gpt-4o' : 'gemini-3.8-flash'),
       systemInstruction: 'Eres un validador de conectividad de IA. Responde únicamente con un objeto JSON {"status":"ok","provider":"' + provider + '"}',
       promptContent: 'Confirma la conexión respondiendo con el JSON solicitado.',
       keys: {
@@ -962,6 +962,7 @@ app.post('/api/analyze-transcript', async (req: Request, res: Response) => {
       aiKeys = {},
       jiraUsers = [],
       jiraConfig = {},
+      existingTopics = [],
     } = req.body;
 
     if (!transcript || typeof transcript !== 'string' || transcript.trim().length === 0) {
@@ -993,6 +994,7 @@ REGLAS CRÍTICAS DE CALIDAD Y ASIGNACIÓN (OBLIGATORIAS):
 
 1. ESTRUCTURACIÓN DEL RESUMEN EJECUTIVO ('executiveSummary'):
    - El campo 'executiveSummary' DEBE adoptar fielmente la estructura, secciones, encabezados, tono y viñetas solicitados por el usuario en su instrucción personalizada / modalidad de prompt.
+   - No generes un resumen corto y escueto. No te limites a generar una lista de tareas. Genera un resumen ejecutivo completo y profesional, incluye todas las secciones que consideres relevantes para el contexto de la reunión. A menos que el usuario indique lo contrario explícitamente.
    - Si el usuario solicita un esquema específico (por ejemplo: Saludo formal, Situación actual agrupada por temas, Decisiones tomadas, Próximos pasos, Dudas o bloqueos pendientes), redacta 'executiveSummary' siguiendo rigurosamente ese orden y esas secciones, empleando saltos de línea claros y formato legible.
    - Si el usuario no especificó una estructura concreta en su instrucción, redacta una síntesis ejecutiva completa, profesional y bien organizada por secciones clave.
 
@@ -1005,7 +1007,21 @@ REGLAS CRÍTICAS DE CALIDAD Y ASIGNACIÓN (OBLIGATORIAS):
      * Si un participante es identificado en el prompt o la llamada como Cliente / Stakeholder / Product Owner, NUNCA le asignes tareas técnicas de programación, desarrollo, pipelines, SQL, DAGs o despliegues (solo validaciones funcionales, aprobaciones o provisión de datos/accesos del cliente).
      * Si se acuerda un compromiso pero nadie específico lo asume en la llamada, asígnalo al facilitador o al 'Equipo de Proyecto' en lugar de atribuirlo al azar.
 
-3. IDENTIFICACIÓN INTELIGENTE: TAREAS EN CURSO VS TAREAS NUEVAS:
+3. UNIFICACIÓN DE TEMAS EN SEGUIMIENTO ('mainTopics'):
+   - Se te provee la lista de "TICKETS EXISTENTES EN EL TABLERO DE JIRA" y de "TEMAS PREVIOS EN EL HISTÓRICO".
+   - Si en la reunión se habla, debate, actualiza o revisa un tema que corresponde a un ticket abierto del tablero o a la continuidad de un tema previo:
+     * 'matchedJiraKey': La clave exacta del ticket de Jira (ej: 'PAY-101' o null). ¡Debe coincidir exactamente con una de las claves provistas!
+     * 'existingTopicId': El ID del tema previo en el histórico (ej: 'topic-123' o null) si corresponde a la continuidad de un tema ya registrado.
+     * 'isExistingTicketTopic': true si corresponde a un ticket abierto o tema en seguimiento.
+     * 'topicName': Utiliza el título del ticket existente o del tema previo en el histórico. ¡ESTÁ TERMINANTEMENTE PROHIBIDO crear un título nuevo o divergente para un ticket o tema que ya está abierto (ej: si ya existe "Modelado de Business Dims y cálculo de Channel STK", mantén ese mismo nombre en lugar de inventar "Lógica de Channel STK y Filtrado de Amagadores")!
+     * 'proposedProgressNote': Redacta una síntesis técnica concisa de las novedades, decisiones o avances discutidos sobre este ticket en esta reunión (ej: "Debate sobre transformar la fecha de cancelación en un flag (not null) para excluir amagadores en marcas del norte y adición del campo de tarifa en prepago."). Esta nota se guardará como nota de avance en el histórico de temas.
+   - Si es un tema nuevo que no corresponde a ningún ticket del tablero ni tema previo:
+     * 'matchedJiraKey': null
+     * 'existingTopicId': null
+     * 'isExistingTicketTopic': false
+     * 'proposedProgressNote': null
+
+4. IDENTIFICACIÓN INTELIGENTE: TAREAS EN CURSO VS TAREAS NUEVAS:
    - Se te proporciona la lista de "TICKETS EXISTENTES EN EL TABLERO DE JIRA" con su clave, título, estado y asignado actual.
    - Si en la reunión se discute, revisa, actualiza, desbloquea o da continuidad a una tarea que YA EXISTE en esa lista:
      * Asigna "taskKind": "existing"
@@ -1022,23 +1038,37 @@ REGLAS CRÍTICAS DE CALIDAD Y ASIGNACIÓN (OBLIGATORIAS):
      * "proposedComment": null
      * "isClosedMatch": false
 
-4. GENERACIÓN CONDICIONAL DE TICKETS NUEVOS (CERO TAREAS DE RELLENO):
-   - Genera ÚNICAMENTE las tareas NUEVAS que realmente surjan como compromisos de la reunión (máximo 4 tickets nuevos) ("taskKind": "new").
+5. GENERACIÓN CONDICIONAL DE TICKETS NUEVOS (CERO TAREAS DE RELLENO):
+   - Genera ÚNICAMENTE las tareas NUEVAS que realmente surjan como compromisos de la reunión (máximo 4 tickets nuevos), si se mencionan mas de una tarea del mismo tema agrupalas en una sola tarjeta. ("taskKind": "new").
    - Si en la llamada solo se revisó el estado de tareas anteriores o no surgieron compromisos nuevos, devuelve ÚNICAMENTE las que correspondan (incluso 0 o 1). ESTÁ PROHIBIDO inventar tareas de relleno para alcanzar un cupo artificial.
    - Las tareas existentes en curso ("taskKind": "existing") NO cuentan para este límite; puedes identificar tantas tareas en curso como se hayan tratado en la reunión.
 
-5. TÍTULOS Y ACCIONABILIDAD:
-   - Cada título debe comenzar con un verbo en infinitivo (ej: 'Concentrar integración de...', 'Implementar...', 'Refactorizar...').
-   - Cada ticket debe incluir criterios de aceptación comprobables y story points razonables (1, 2, 3, 5, 8).
+6. TÍTULOS Y ACCIONABILIDAD:
+   - Cada título de tarea nueva debe comenzar con un verbo en infinitivo (ej: 'Concentrar integración de...', 'Implementar...', 'Refactorizar...').
+   - Cada ticket nuevo debe incluir criterios de aceptación comprobables y story points razonables (1, 2, 3, 5, 8).
 
-6. FORMATO:
+7. FORMATO:
    - Responde SIEMPRE en español en un formato JSON estrictamente válido que cumpla con el siguiente esquema:
    {
      "meetingTitle": "string",
      "meetingDate": "YYYY-MM-DD",
      "executiveSummary": "string",
      "keyDecisions": ["string"],
-     "mainTopics": [{ "id": "top-1", "topicName": "string", "category": "string", "discussionSummary": "string", "status": "En Progreso|Completado|Bloqueado|Pendiente", "riskLevel": "Bajo|Medio|Alto", "leadAssignee": "string" }],
+     "mainTopics": [
+       {
+         "id": "top-1",
+         "topicName": "string",
+         "category": "string",
+         "discussionSummary": "string",
+         "status": "En Progreso|Completado|Bloqueado|Pendiente",
+         "riskLevel": "Bajo|Medio|Alto",
+         "leadAssignee": "string",
+         "matchedJiraKey": "PAY-101 o null",
+         "existingTopicId": "topic-123 o null",
+         "isExistingTicketTopic": false,
+         "proposedProgressNote": "string o null"
+       }
+     ],
      "participants": [{ "name": "string", "role": "string", "totalTasks": 1, "sentimentOrFocus": "string" }],
      "actionItems": [
        {
@@ -1076,12 +1106,15 @@ ${JSON.stringify((jiraUsers || []).map((u: any) => ({ name: u.displayName, role:
 TICKETS EXISTENTES EN EL TABLERO DE JIRA (${boardTickets.length} candidatos relevantes analizados del tablero y backlog):
 ${JSON.stringify(boardTickets.map((t) => ({ key: t.key, summary: t.summary, status: t.status, statusCategory: t.statusCategory, assignee: t.assignee, isClosed: t.isClosed })), null, 2)}
 
+TEMAS PREVIOS EN EL HISTÓRICO DEL PROYECTO (${existingTopics.length} temas registrados):
+${JSON.stringify((existingTopics || []).slice(0, 30).map((t: any) => ({ id: t.id, topicName: t.topicName, category: t.category, associatedJiraKeys: t.associatedJiraKeys, leadParticipant: t.leadParticipant, status: t.status })), null, 2)}
+
 TRANSCRIPCIÓN O APUNTES DE LA REUNIÓN EN TEAMS:
 """
 ${transcript.slice(0, 30000)}
 """
 
-Extrae el resumen ejecutivo, acuerdos, temas, participantes y los action items clasificados (nuevos vs existentes en curso con propuesta de comentario).`;
+Extrae el resumen ejecutivo, acuerdos, temas (unificando con tickets/temas previos si corresponde), participantes y los action items clasificados.`;
 
     try {
       const rawResponse = await callAIProvider({
@@ -1095,12 +1128,12 @@ Extrae el resumen ejecutivo, acuerdos, temas, participantes y los action items c
       const parsed = parseLlmJsonResponse(rawResponse);
 
       // Post-process sanitation & validation against actual board tickets
-      if (Array.isArray(parsed.actionItems)) {
-        const cleanDomain = (effectiveJiraConfig?.domain || '').trim().replace(/^https?:\/\//, '').replace(/\/$/, '');
-        const isLiveJira = effectiveJiraConfig?.simulationMode === false;
-        const validBoardKeys = new Set(boardTickets.map((t) => t.key.toUpperCase()));
-        const boardKeyMap = new Map(boardTickets.map((t) => [t.key.toUpperCase(), t]));
+      const cleanDomain = (effectiveJiraConfig?.domain || '').trim().replace(/^https?:\/\//, '').replace(/\/$/, '');
+      const validBoardKeys = new Set(boardTickets.map((t) => t.key.toUpperCase()));
+      const boardKeyMap = new Map(boardTickets.map((t) => [t.key.toUpperCase(), t]));
+      const existingTopicIds = new Set((existingTopics || []).map((t: any) => t.id));
 
+      if (Array.isArray(parsed.actionItems)) {
         parsed.actionItems.forEach((item: any, idx: number) => {
           if (isNonPersonName(item.assignee)) {
             const fallbackHuman = parsed.participants?.find((p: any) => !isNonPersonName(p.name))?.name || jiraUsers?.[0]?.displayName || 'Equipo de Proyecto';
@@ -1153,6 +1186,54 @@ Extrae el resumen ejecutivo, acuerdos, temas, participantes y los action items c
             }];
           }
         }
+      }
+
+      // Post-process sanitation for mainTopics
+      if (Array.isArray(parsed.mainTopics)) {
+        parsed.mainTopics.forEach((top: any, idx: number) => {
+          if (!top.id) top.id = `top-${idx + 1}`;
+          if (!top.status) top.status = 'En Progreso';
+          if (!top.riskLevel) top.riskLevel = 'Medio';
+
+          // Validate matchedJiraKey against real board keys
+          if (top.matchedJiraKey) {
+            const cleanKey = String(top.matchedJiraKey).trim().toUpperCase();
+            if (validBoardKeys.has(cleanKey)) {
+              top.matchedJiraKey = cleanKey;
+              top.isExistingTicketTopic = true;
+            } else {
+              top.matchedJiraKey = null;
+              top.isExistingTicketTopic = false;
+            }
+          }
+
+          // If the topic has no matchedJiraKey, check if any actionItem under this topic matched a ticket
+          if (!top.matchedJiraKey && Array.isArray(parsed.actionItems)) {
+            const matchingAction = parsed.actionItems.find(
+              (a: any) =>
+                a.matchedJiraKey &&
+                (a.topicName?.toLowerCase().trim() === top.topicName?.toLowerCase().trim() ||
+                  top.topicName?.toLowerCase().includes(a.matchedJiraKey.toLowerCase()))
+            );
+            if (matchingAction && matchingAction.matchedJiraKey) {
+              top.matchedJiraKey = matchingAction.matchedJiraKey;
+              top.isExistingTicketTopic = true;
+              if (!top.proposedProgressNote && matchingAction.proposedComment) {
+                top.proposedProgressNote = matchingAction.proposedComment;
+              }
+            }
+          }
+
+          // Validate existingTopicId
+          if (top.existingTopicId && !existingTopicIds.has(top.existingTopicId)) {
+            top.existingTopicId = null;
+          }
+
+          // Fallback note if it's an existing ticket topic but proposedProgressNote was omitted
+          if ((top.matchedJiraKey || top.existingTopicId || top.isExistingTicketTopic) && !top.proposedProgressNote) {
+            top.proposedProgressNote = top.discussionSummary || 'Seguimiento y revisión del estado de la tarea en reunión.';
+          }
+        });
       }
 
       return res.json({

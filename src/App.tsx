@@ -139,6 +139,14 @@ export default function App() {
           },
           jiraConfig,
           jiraUsers: projectSettings.jiraUsers,
+          existingTopics: (loadTopicHistory() || []).map((t) => ({
+            id: t.id,
+            topicName: t.topicName,
+            category: t.category,
+            associatedJiraKeys: t.associatedJiraKeys || [],
+            leadParticipant: t.leadParticipant,
+            status: t.status,
+          })),
         }),
       });
 
@@ -181,19 +189,104 @@ export default function App() {
     }
   };
 
-  // Helper: Sync meeting topics into Topic History database
+  // Helper: Normalize topic text for resilient comparisons
+  const normalizeTopicText = (text: string): string => {
+    return (text || '')
+      .toLowerCase()
+      .normalize('NFD')
+      .replace(/[\u0300-\u036f]/g, '')
+      .replace(/[^a-z0-9\s]/g, ' ')
+      .replace(/\s+/g, ' ')
+      .trim();
+  };
+
+  // Helper: Token-based similarity calculation
+  const calculateWordOverlap = (strA: string, strB: string): number => {
+    const wordsA = new Set(normalizeTopicText(strA).split(' ').filter((w) => w.length > 3));
+    const wordsB = new Set(normalizeTopicText(strB).split(' ').filter((w) => w.length > 3));
+    if (wordsA.size === 0 || wordsB.size === 0) return 0;
+    let common = 0;
+    wordsA.forEach((w) => {
+      if (wordsB.has(w)) common++;
+    });
+    return (common * 2) / (wordsA.size + wordsB.size);
+  };
+
+  // Helper: Sync meeting topics into Topic History database with smart deduplication & note appending
   const syncMeetingToTopicHistory = (meeting: MeetingAnalysis) => {
     const existing = loadTopicHistory();
     const updated = [...existing];
 
     (meeting.mainTopics || []).forEach((top) => {
-      const matchIdx = updated.findIndex(
-        (t) => t.topicName.toLowerCase().trim() === top.topicName.toLowerCase().trim()
+      // 1. Gather candidate Jira keys from topic or related action items
+      const candidateKeysSet = new Set<string>();
+      if (top.matchedJiraKey) {
+        candidateKeysSet.add(top.matchedJiraKey.toUpperCase().trim());
+      }
+
+      // Find action items corresponding to this topic
+      const relatedActions = (meeting.actionItems || []).filter(
+        (a) =>
+          (a.topicName && a.topicName.toLowerCase().trim() === top.topicName.toLowerCase().trim()) ||
+          (top.matchedJiraKey && a.matchedJiraKey?.toUpperCase() === top.matchedJiraKey.toUpperCase())
       );
 
+      relatedActions.forEach((a) => {
+        if (a.matchedJiraKey) candidateKeysSet.add(a.matchedJiraKey.toUpperCase().trim());
+        if (a.jiraTicketKey) candidateKeysSet.add(a.jiraTicketKey.toUpperCase().trim());
+      });
+
+      const candidateKeys = Array.from(candidateKeysSet);
+
+      // 2. Hierarchical Matching to find existing topic:
+      let matchIdx = -1;
+
+      // Check A: By explicit existingTopicId returned by AI
+      if (top.existingTopicId) {
+        matchIdx = updated.findIndex((t) => t.id === top.existingTopicId);
+      }
+
+      // Check B: By associated Jira Keys match
+      if (matchIdx < 0 && candidateKeys.length > 0) {
+        matchIdx = updated.findIndex((t) => {
+          const tKeys = (t.associatedJiraKeys || []).map((k) => k.toUpperCase().trim());
+          const hasKeyMatch = candidateKeys.some((k) => tKeys.includes(k));
+          if (hasKeyMatch) return true;
+          // Also check if the topic name explicitly contains the ticket key
+          return candidateKeys.some((k) => t.topicName.toUpperCase().includes(k));
+        });
+      }
+
+      // Check C: By normalized topicName exact equality
+      if (matchIdx < 0) {
+        const normTopName = normalizeTopicText(top.topicName);
+        matchIdx = updated.findIndex((t) => normalizeTopicText(t.topicName) === normTopName);
+      }
+
+      // Check D: By high word overlap (>= 65% overlap in significant keywords)
+      if (matchIdx < 0) {
+        let bestScore = 0;
+        let bestIdx = -1;
+        updated.forEach((t, idx) => {
+          const score = calculateWordOverlap(t.topicName, top.topicName);
+          if (score > bestScore && score >= 0.65) {
+            bestScore = score;
+            bestIdx = idx;
+          }
+        });
+        if (bestIdx >= 0) {
+          matchIdx = bestIdx;
+        }
+      }
+
+      const dateFormatted = new Date(meeting.meetingDate).toLocaleDateString('es-ES', { timeZone: 'UTC' });
+      const summaryNote = (top.proposedProgressNote || top.discussionSummary || 'Seguimiento en reunión.').trim();
+
       if (matchIdx >= 0) {
-        // Topic exists: append meeting discussion
+        // TOPIC EXISTS: Append meeting and register new progress note (DO NOT DUPLICATE)
         const t = updated[matchIdx];
+
+        // 1. Update meetings history
         const meetingExists = t.meetings.some((m) => m.meetingId === meeting.id);
         const newMeetings = meetingExists
           ? t.meetings
@@ -207,15 +300,38 @@ export default function App() {
               },
             ];
 
+        // 2. Add progress note to topic notes
+        const notePrefix = `${dateFormatted} [${meeting.meetingTitle}]:`;
+        const newNoteEntry = `${notePrefix} ${summaryNote}`;
+        const existingNotes = t.notes || [];
+        const noteAlreadyExists = existingNotes.some(
+          (n) => n.startsWith(notePrefix) || n.includes(summaryNote)
+        );
+        const updatedNotes = noteAlreadyExists ? existingNotes : [...existingNotes, newNoteEntry];
+
+        // 3. Merge Jira keys
+        const mergedKeys = Array.from(
+          new Set([...(t.associatedJiraKeys || []), ...candidateKeys])
+        );
+
+        // 4. Merge participants
+        const mergedParticipants = Array.from(
+          new Set([...(t.allParticipants || []), ...meeting.participants.map((p) => p.name)])
+        );
+
         updated[matchIdx] = {
           ...t,
           lastDiscussedDate: meeting.meetingDate,
-          status: top.status as TopicStatus,
+          status: top.status === 'Completado' ? 'Completado' : t.status === 'Completado' ? 'Completado' : (top.status as TopicStatus),
+          progressPercent: top.status === 'Completado' ? 100 : t.progressPercent,
           meetings: newMeetings,
+          notes: updatedNotes,
+          associatedJiraKeys: mergedKeys,
+          allParticipants: mergedParticipants,
           updatedAt: new Date().toISOString(),
         };
       } else {
-        // New topic
+        // TRULY NEW TOPIC
         updated.unshift({
           id: 'topic-' + Date.now() + '-' + Math.random().toString(36).substring(2, 6),
           topicName: top.topicName,
@@ -233,9 +349,11 @@ export default function App() {
           status: top.status as TopicStatus,
           leadParticipant: top.leadAssignee || meeting.participants[0]?.name || 'Equipo',
           allParticipants: meeting.participants.map((p) => p.name),
-          associatedJiraKeys: [],
+          associatedJiraKeys: candidateKeys,
           progressPercent: top.status === 'Completado' ? 100 : top.status === 'En Progreso' ? 50 : 20,
-          notes: [`${new Date().toLocaleDateString('es-ES')}: Identificado en reunión '${meeting.meetingTitle}'.`],
+          notes: [
+            `${dateFormatted}: Identificado en reunión '${meeting.meetingTitle}'. ${summaryNote}`.trim(),
+          ],
           updatedAt: new Date().toISOString(),
         });
       }
@@ -749,6 +867,68 @@ export default function App() {
     showToast('info', 'Histórico de temas vaciado por completo.');
   };
 
+  // Handler: Merge duplicate topics into a single topic
+  const handleMergeTopics = (sourceTopicId: string, targetTopicId: string) => {
+    const current = loadTopicHistory();
+    const source = current.find((t) => t.id === sourceTopicId);
+    const target = current.find((t) => t.id === targetTopicId);
+    if (!source || !target || source.id === target.id) return;
+
+    // Combine meetings without duplicate meetingIds
+    const existingMeetingIds = new Set(target.meetings.map((m) => m.meetingId));
+    const combinedMeetings = [...target.meetings];
+    source.meetings.forEach((m) => {
+      if (!existingMeetingIds.has(m.meetingId)) {
+        combinedMeetings.push(m);
+        existingMeetingIds.add(m.meetingId);
+      }
+    });
+    combinedMeetings.sort((a, b) => (a.date || '').localeCompare(b.date || ''));
+
+    // Combine notes without exact duplicates
+    const combinedNotes = [...(target.notes || [])];
+    (source.notes || []).forEach((n) => {
+      if (!combinedNotes.includes(n)) {
+        combinedNotes.push(n);
+      }
+    });
+
+    // Combine associated Jira keys
+    const combinedKeys = Array.from(
+      new Set([...(target.associatedJiraKeys || []), ...(source.associatedJiraKeys || [])])
+    );
+
+    // Combine participants
+    const combinedParticipants = Array.from(
+      new Set([...(target.allParticipants || []), ...(source.allParticipants || [])])
+    );
+
+    const mergedTarget: TopicHistoryRecord = {
+      ...target,
+      meetings: combinedMeetings,
+      notes: combinedNotes,
+      associatedJiraKeys: combinedKeys,
+      allParticipants: combinedParticipants,
+      firstDiscussedDate:
+        source.firstDiscussedDate && source.firstDiscussedDate < target.firstDiscussedDate
+          ? source.firstDiscussedDate
+          : target.firstDiscussedDate,
+      lastDiscussedDate:
+        source.lastDiscussedDate && source.lastDiscussedDate > target.lastDiscussedDate
+          ? source.lastDiscussedDate
+          : target.lastDiscussedDate,
+      updatedAt: new Date().toISOString(),
+    };
+
+    const updated = current
+      .filter((t) => t.id !== sourceTopicId)
+      .map((t) => (t.id === targetTopicId ? mergedTarget : t));
+
+    saveTopicHistory(updated);
+    setTopicsHistory(updated);
+    showToast('success', `Tema "${source.topicName}" fusionado con éxito en "${target.topicName}".`);
+  };
+
   // Handler: Save Project Settings (Story Points, Categories, Jira Users, Connection)
   const handleSaveProjectSettings = (newSettings: ProjectSettings) => {
     setProjectSettings(newSettings);
@@ -927,6 +1107,7 @@ export default function App() {
             onAddNewTopic={handleAddNewTopic}
             onDeleteTopic={handleDeleteTopic}
             onClearAllTopics={handleClearAllTopics}
+            onMergeTopics={handleMergeTopics}
             onGoToMonthlyReport={() => setActiveTab('monthly')}
             topicCategories={projectSettings.topicCategories}
             jiraUsers={projectSettings.jiraUsers}

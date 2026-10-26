@@ -22,7 +22,8 @@ import {
   Users,
   Trash2,
   AlertCircle,
-  X
+  X,
+  GitMerge
 } from 'lucide-react';
 import { TopicHistoryRecord, TopicStatus, JiraUser } from '../types';
 import { exportTopicsToCsv, downloadFile } from '../utils/exportUtils';
@@ -34,6 +35,7 @@ interface TopicHistoryTabProps {
   onAddNewTopic: (topic: TopicHistoryRecord) => void;
   onDeleteTopic: (topicId: string) => void;
   onClearAllTopics?: () => void;
+  onMergeTopics?: (sourceTopicId: string, targetTopicId: string) => void;
   onGoToMonthlyReport: () => void;
   topicCategories?: string[];
   jiraUsers?: JiraUser[];
@@ -46,6 +48,7 @@ export const TopicHistoryTab: React.FC<TopicHistoryTabProps> = ({
   onAddNewTopic,
   onDeleteTopic,
   onClearAllTopics,
+  onMergeTopics,
   onGoToMonthlyReport,
   topicCategories = DEFAULT_TOPIC_CATEGORIES,
   jiraUsers = DEFAULT_JIRA_USERS,
@@ -59,6 +62,8 @@ export const TopicHistoryTab: React.FC<TopicHistoryTabProps> = ({
   const [newNoteText, setNewNoteText] = useState<{ [topicId: string]: string }>({});
   const [confirmDeleteId, setConfirmDeleteId] = useState<string | null>(null);
   const [showClearConfirm, setShowClearConfirm] = useState(false);
+  const [mergeSourceTopic, setMergeSourceTopic] = useState<TopicHistoryRecord | null>(null);
+  const [mergeTargetId, setMergeTargetId] = useState<string>('');
 
   const effectiveCategories = topicCategories.length > 0 ? topicCategories : DEFAULT_TOPIC_CATEGORIES;
   const effectiveJiraUsers = jiraUsers.length > 0 ? jiraUsers : DEFAULT_JIRA_USERS;
@@ -323,6 +328,19 @@ export const TopicHistoryTab: React.FC<TopicHistoryTabProps> = ({
                       <span className="text-[11px] text-slate-500 font-mono">
                         Tratado en {topic.meetings.length} {topic.meetings.length === 1 ? 'reunión' : 'reuniones'}
                       </span>
+                      {topic.associatedJiraKeys && topic.associatedJiraKeys.length > 0 && (
+                        <div className="flex flex-wrap items-center gap-1">
+                          {topic.associatedJiraKeys.map((k) => (
+                            <span
+                              key={k}
+                              className="text-[10px] font-mono font-bold bg-[#1d2b4f] text-[#61BFED] border border-[#61BFED]/40 px-2 py-0.5 rounded-md flex items-center gap-1 shadow-xs"
+                            >
+                              <Tag className="w-2.5 h-2.5 text-[#61BFED]" />
+                              {k}
+                            </span>
+                          ))}
+                        </div>
+                      )}
                     </div>
 
                     <h3 className="text-base font-bold text-white leading-snug">
@@ -341,7 +359,7 @@ export const TopicHistoryTab: React.FC<TopicHistoryTabProps> = ({
                     </div>
                   </div>
 
-                  {/* Right Side: Progress Bar, Delete & Toggle */}
+                  {/* Right Side: Progress Bar, Delete, Merge & Toggle */}
                   <div className="flex items-center gap-4 w-full md:w-auto justify-between md:justify-end">
                     <div className="w-32 sm:w-36 space-y-1">
                       <div className="flex justify-between text-[11px] text-slate-400 font-medium">
@@ -363,6 +381,21 @@ export const TopicHistoryTab: React.FC<TopicHistoryTabProps> = ({
                     </div>
 
                     <div className="flex items-center gap-2">
+                      {onMergeTopics && topics.length > 1 && (
+                        <button
+                          onClick={() => {
+                            setMergeSourceTopic(topic);
+                            const firstOther = topics.find((t) => t.id !== topic.id);
+                            setMergeTargetId(firstOther ? firstOther.id : '');
+                          }}
+                          title="Fusionar este tema con otro tema abierto"
+                          className="px-2.5 py-1.5 rounded-lg bg-slate-800 hover:bg-slate-750 text-slate-300 hover:text-white text-xs font-medium border border-slate-700 flex items-center gap-1 transition-colors cursor-pointer"
+                        >
+                          <GitMerge className="w-3.5 h-3.5 text-[#EE880E]" />
+                          <span className="hidden sm:inline">Fusionar</span>
+                        </button>
+                      )}
+
                       <button
                         onClick={() => setExpandedTopicId(isExpanded ? null : topic.id)}
                         className="px-3 py-1.5 rounded-lg bg-slate-800 hover:bg-slate-750 text-slate-200 text-xs font-medium border border-slate-700 flex items-center gap-1 transition-colors"
@@ -489,11 +522,28 @@ export const TopicHistoryTab: React.FC<TopicHistoryTabProps> = ({
                       </h4>
                       <div className="space-y-1.5">
                         {topic.notes && topic.notes.length > 0 ? (
-                          topic.notes.map((note, nIdx) => (
-                            <div key={nIdx} className="text-xs text-slate-300 bg-slate-900 p-2.5 rounded-lg border border-slate-800/80">
-                              {note}
-                            </div>
-                          ))
+                          topic.notes.map((note, nIdx) => {
+                            const isMeetingNote = note.includes('[') && note.includes(']:');
+                            return (
+                              <div
+                                key={nIdx}
+                                className={`text-xs p-2.5 rounded-lg border leading-relaxed flex items-start gap-2.5 ${
+                                  isMeetingNote
+                                    ? 'bg-slate-900/90 border-[#29E78C]/30 text-slate-200'
+                                    : 'bg-slate-900 border-slate-800/80 text-slate-300'
+                                }`}
+                              >
+                                {isMeetingNote ? (
+                                  <Calendar className="w-3.5 h-3.5 text-[#29E78C] shrink-0 mt-0.5" />
+                                ) : (
+                                  <MessageSquare className="w-3.5 h-3.5 text-slate-500 shrink-0 mt-0.5" />
+                                )}
+                                <div className="flex-1">
+                                  <span>{note}</span>
+                                </div>
+                              </div>
+                            );
+                          })
                         ) : (
                           <div className="text-xs text-slate-500 italic">No hay notas registradas todavía.</div>
                         )}
@@ -641,6 +691,88 @@ export const TopicHistoryTab: React.FC<TopicHistoryTabProps> = ({
                 </button>
               </div>
             </form>
+          </div>
+        </div>
+      )}
+
+      {/* Merge Duplicate Topics Modal */}
+      {mergeSourceTopic && (
+        <div className="fixed inset-0 z-50 flex items-center justify-center bg-black/75 backdrop-blur-xs p-4 animate-in fade-in">
+          <div className="bg-[#1C1E20] border border-[#2E3135] rounded-2xl max-w-lg w-full p-6 space-y-4 shadow-2xl">
+            <div className="flex items-center justify-between pb-3 border-b border-[#2E3135]">
+              <div className="flex items-center gap-2.5">
+                <div className="w-8 h-8 rounded-lg bg-[#EE880E]/15 border border-[#EE880E]/30 flex items-center justify-center text-[#EE880E]">
+                  <GitMerge className="w-4 h-4" />
+                </div>
+                <div>
+                  <h3 className="text-sm font-bold text-white font-['Lato']">Fusionar Temas Duplicados</h3>
+                  <p className="text-[11px] text-slate-400">Consolida sesiones, notas y tickets en un solo tema</p>
+                </div>
+              </div>
+              <button
+                onClick={() => setMergeSourceTopic(null)}
+                className="text-slate-400 hover:text-white p-1 rounded-lg hover:bg-slate-800"
+              >
+                <X className="w-4 h-4" />
+              </button>
+            </div>
+
+            <div className="space-y-3 text-xs">
+              <div className="bg-[#141517] p-3 rounded-xl border border-[#2A2C2F] space-y-1">
+                <span className="text-[11px] text-slate-400 block font-medium">Tema que se fusionará (origen):</span>
+                <span className="text-white font-bold block">{mergeSourceTopic.topicName}</span>
+                <span className="text-[11px] text-slate-500 font-mono block">
+                  {mergeSourceTopic.meetings.length} reuniones tratadas · {mergeSourceTopic.notes?.length || 0} notas
+                  {mergeSourceTopic.associatedJiraKeys && mergeSourceTopic.associatedJiraKeys.length > 0
+                    ? ` · Tickets: ${mergeSourceTopic.associatedJiraKeys.join(', ')}`
+                    : ''}
+                </span>
+              </div>
+
+              <div className="space-y-1.5">
+                <label className="text-[11px] font-bold text-slate-300 block">
+                  Seleccionar tema de destino principal:
+                </label>
+                <select
+                  value={mergeTargetId}
+                  onChange={(e) => setMergeTargetId(e.target.value)}
+                  className="w-full bg-[#141517] border border-[#3E4247] rounded-xl px-3 py-2 text-xs text-white focus:outline-hidden focus:border-[#FF5038]"
+                >
+                  {topics
+                    .filter((t) => t.id !== mergeSourceTopic.id)
+                    .map((t) => (
+                      <option key={t.id} value={t.id}>
+                        {t.topicName} ({t.category} - {t.meetings.length} reuniones)
+                      </option>
+                    ))}
+                </select>
+                <p className="text-[11px] text-slate-400 leading-relaxed pt-1">
+                  Las reuniones tratadas, las notas históricas y las claves de Jira de ambos temas se unificarán en el tema de destino seleccionado. El tema origen será eliminado.
+                </p>
+              </div>
+            </div>
+
+            <div className="flex items-center justify-end gap-2 pt-3 border-t border-[#2E3135]">
+              <button
+                onClick={() => setMergeSourceTopic(null)}
+                className="px-3 py-1.5 rounded-xl bg-slate-800 hover:bg-slate-700 text-slate-300 text-xs font-medium cursor-pointer"
+              >
+                Cancelar
+              </button>
+              <button
+                onClick={() => {
+                  if (mergeSourceTopic && mergeTargetId && onMergeTopics) {
+                    onMergeTopics(mergeSourceTopic.id, mergeTargetId);
+                    setMergeSourceTopic(null);
+                  }
+                }}
+                disabled={!mergeTargetId}
+                className="px-4 py-1.5 rounded-xl bg-gradient-to-r from-[#FF5038] to-[#EE880E] hover:from-[#E6422C] hover:to-[#DE7B0A] text-white text-xs font-bold shadow-md shadow-[#FF5038]/20 flex items-center gap-1.5 disabled:opacity-50 cursor-pointer"
+              >
+                <GitMerge className="w-3.5 h-3.5" />
+                <span>Confirmar Fusión</span>
+              </button>
+            </div>
           </div>
         </div>
       )}

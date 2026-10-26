@@ -87,6 +87,10 @@ export interface TopicItem {
   status: TopicStatus;
   riskLevel: 'Bajo' | 'Medio' | 'Alto';
   leadAssignee?: string;
+  matchedJiraKey?: string | null;
+  existingTopicId?: string | null;
+  proposedProgressNote?: string | null;
+  isExistingTicketTopic?: boolean;
 }
 
 export interface RACIRow {

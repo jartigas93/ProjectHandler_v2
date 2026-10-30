@@ -2,6 +2,7 @@ import React, { useState, useEffect } from 'react';
 import { X, Mail, Copy, Check, ExternalLink, Send, FileText } from 'lucide-react';
 import { MeetingAnalysis } from '../types';
 import { formatEmailSummary } from '../utils/exportUtils';
+import { AutoResizeTextarea } from './AutoResizeTextarea';
 
 interface EmailShareModalProps {
   isOpen: boolean;
@@ -119,11 +120,11 @@ export const EmailShareModal: React.FC<EmailShareModalProps> = ({
                 Redacción profesional limpia
               </span>
             </div>
-            <textarea
+            <AutoResizeTextarea
               value={body}
               onChange={(e) => setBody(e.target.value)}
-              rows={12}
-              className="w-full bg-[#141517] border border-[#2A2C2F] rounded-xl p-3.5 text-xs text-slate-200 focus:outline-hidden focus:border-[#FF5038] font-['Montserrat'] leading-relaxed resize-y"
+              minRows={6}
+              className="w-full bg-[#141517] border border-[#2A2C2F] rounded-xl p-3.5 text-xs text-slate-200 focus:outline-hidden focus:border-[#FF5038] font-['Montserrat'] leading-relaxed"
             />
           </div>
         </div>

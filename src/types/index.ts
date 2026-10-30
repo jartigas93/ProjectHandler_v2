@@ -39,6 +39,26 @@ export interface Participant {
   capacityLimit?: number;
 }
 
+export type JiraLinkRelationType = 'none' | 'relates' | 'is_blocked_by' | 'blocks' | 'cloners';
+
+export interface JiraEpic {
+  key: string;
+  summary: string;
+  status?: string;
+}
+
+export interface CloneTaskOptions {
+  newTopicCategory?: string;
+  linkType?: JiraLinkRelationType;
+  sourceTicketKey?: string;
+  sourceItemId?: string;
+  splitCriteria?: {
+    movedCriteria: string[];
+    remainingCriteria: string[];
+    updateOriginalInJira: boolean;
+  };
+}
+
 export interface ActionItem {
   id: string;
   title: string;
@@ -55,6 +75,11 @@ export interface ActionItem {
   definitionOfDone?: string[];
   jiraLabels: string[];
   technicalContext?: string;
+  // Epic / Parent & Traceability
+  epicKey?: string;
+  epicSummary?: string;
+  derivedFromKey?: string;
+  jiraLinkType?: JiraLinkRelationType;
   // Jira Sync Status
   jiraTicketKey?: string;
   jiraTicketUrl?: string;
@@ -77,6 +102,7 @@ export interface ActionItem {
   isClosedMatch?: boolean;
   commentStatus?: 'pending' | 'added' | 'failed';
   commentAddedAt?: string;
+  lastCommentId?: string;
 }
 
 export interface TopicItem {
@@ -229,6 +255,29 @@ export interface SavedCustomPrompt {
   createdAt?: string;
 }
 
+export type DatabaseType = 'none' | 'sqlite' | 'postgres' | 'mysql' | 'mongodb' | 'snowflake' | 'rest';
+
+export interface DatabaseConfig {
+  enabled: boolean;
+  type: DatabaseType;
+  connectionString?: string;
+  host?: string;
+  port?: number;
+  database?: string;
+  username?: string;
+  password?: string;
+  ssl?: boolean;
+  authToken?: string; // Token Bearer o API Key (REST / Snowflake SQL API)
+  // Snowflake specific
+  snowflakeAccount?: string; // e.g. "xy12345.eu-west-1" o "myorg-myaccount"
+  snowflakeWarehouse?: string; // e.g. "COMPUTE_WH"
+  snowflakeSchema?: string; // e.g. "PUBLIC" o "PROJECTHANDLER"
+  snowflakeRole?: string; // e.g. "ACCOUNTADMIN" o "SYSADMIN"
+  tableName?: string; // Nombre de tabla / colección (default: "projecthandler_store")
+  autoSync?: boolean; // Sincronización continua
+  lastSyncedAt?: string;
+}
+
 export interface ProjectSettings {
   storyPointsScale: number[];
   defaultStoryPoints: number;
@@ -238,6 +287,8 @@ export interface ProjectSettings {
   jiraUsers: JiraUser[];
   jira: JiraConfig;
   ai: AIProviderConfig;
+  database?: DatabaseConfig;
   savedCustomPrompts?: SavedCustomPrompt[];
 }
+
 

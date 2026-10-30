@@ -4,6 +4,7 @@ import dotenv from 'dotenv';
 import path from 'path';
 import { fileURLToPath } from 'url';
 import { GoogleGenAI, Type } from '@google/genai';
+import { agnosticDb, DatabaseConfig } from './server/db/agnosticDb';
 
 dotenv.config();
 
@@ -1028,7 +1029,7 @@ REGLAS CRÍTICAS DE CALIDAD Y ASIGNACIÓN (OBLIGATORIAS):
      * "matchedJiraKey": La clave exacta del ticket (ej: "PAY-101"). ¡OBLIGATORIO: DEBE coincidir exactamente con una de las claves de la lista provista, NUNCA inventes claves!
      * "matchConfidence": "Alta" | "Media" | "Baja"
      * "matchReason": Explicación concisa de por qué coincide con la conversación.
-     * "proposedComment": Redacta un comentario técnico profesional para Jira resumiendo las novedades, decisiones o avances acordados en esta reunión.
+     * "proposedComment": Redacta un comentario técnico profesional para Jira con el siguiente formato obligatorio: "Avance [FECHA_REUNIÓN]: [Resumen conciso y técnico de novedades, decisiones o avances acordados en esta reunión].\n\nCriterios de Aceptación ([N]):\n[Criterio 1 acordado o verificado]\n[Criterio 2 acordado o verificado]..." (donde [N] es el número de criterios de aceptación y se listan uno por línea).
      * Si el ticket existente está cerrado/Done en la lista provista: añade "isClosedMatch": true.
    - Si es un trabajo nuevo que no corresponde a ninguno de los tickets existentes en el tablero:
      * Asigna "taskKind": "new"
@@ -1157,6 +1158,17 @@ Extrae el resumen ejecutivo, acuerdos, temas (unificando con tickets/temas previ
               item.jiraStatusCategory = boardItem?.statusCategory;
               item.isClosedMatch = boardItem?.isClosed || item.isClosedMatch || false;
               item.commentStatus = 'pending';
+
+              // Ensure proposedComment contains acceptance criteria formatted if available
+              if (item.proposedComment && Array.isArray(item.acceptanceCriteria) && item.acceptanceCriteria.length > 0) {
+                const norm = item.proposedComment.toLowerCase();
+                if (!norm.includes('criterios de aceptación') && !norm.includes('criterios de aceptacion')) {
+                  const criteriaList = item.acceptanceCriteria.map((c: string) => String(c).trim()).filter(Boolean);
+                  if (criteriaList.length > 0) {
+                    item.proposedComment = `${item.proposedComment.trim()}\n\nCriterios de Aceptación (${criteriaList.length}):\n${criteriaList.join('\n')}`;
+                  }
+                }
+              }
             } else {
               // Degrade hallucinated key to new task
               item.taskKind = 'new';
@@ -1281,10 +1293,299 @@ app.post('/api/jira/board-context', async (req: Request, res: Response) => {
   }
 });
 
-// Endpoint: Add Comment to an Existing Jira Issue
+// Cache for Jira Issue Link Types per domain
+const jiraIssueLinkTypesCache = new Map<string, any[]>();
+
+// Helper: Create native Jira Issue Link between two tickets
+async function linkJiraIssuesInCloud(
+  domain: string,
+  authHeader: string,
+  newIssueKey: string,
+  sourceIssueKey: string,
+  relationType: 'relates' | 'is_blocked_by' | 'blocks' | 'cloners'
+): Promise<{ linked: boolean; linkTypeName?: string; warning?: string }> {
+  try {
+    let linkTypes = jiraIssueLinkTypesCache.get(domain);
+    if (!linkTypes) {
+      const typesRes = await fetch(`https://${domain}/rest/api/3/issueLinkType`, {
+        headers: { Authorization: authHeader, Accept: 'application/json' },
+      });
+      if (typesRes.ok) {
+        const typesData = (await typesRes.json()) as any;
+        const fetchedTypes: any[] = Array.isArray(typesData.issueLinkTypes) ? typesData.issueLinkTypes : [];
+        linkTypes = fetchedTypes;
+        jiraIssueLinkTypesCache.set(domain, fetchedTypes);
+      } else {
+        linkTypes = [];
+      }
+    }
+
+    // Match appropriate link type in English or Spanish instances
+    let chosenTypeName = 'Relates';
+    if (linkTypes && linkTypes.length > 0) {
+      const findType = (patterns: RegExp[]) =>
+        linkTypes!.find((lt: any) =>
+          patterns.some(
+            (rx) =>
+              rx.test(String(lt.name || '')) ||
+              rx.test(String(lt.inward || '')) ||
+              rx.test(String(lt.outward || ''))
+          )
+        );
+
+      if (relationType === 'blocks' || relationType === 'is_blocked_by') {
+        const found = findType([/block/i, /bloque/i]);
+        if (found?.name) chosenTypeName = found.name;
+      } else if (relationType === 'cloners') {
+        const found = findType([/clon/i]);
+        if (found?.name) chosenTypeName = found.name;
+      } else {
+        const found = findType([/relat/i, /relacion/i]);
+        if (found?.name) chosenTypeName = found.name;
+      }
+    } else {
+      chosenTypeName =
+        relationType === 'blocks' || relationType === 'is_blocked_by'
+          ? 'Blocks'
+          : relationType === 'cloners'
+          ? 'Cloners'
+          : 'Relates';
+    }
+
+    // In Jira REST API v3 /rest/api/3/issueLink:
+    // For "Blocks" (outward="blocks", inward="is blocked by"):
+    // inwardIssue is the issue that HAS the outward relation ("blocks") toward outwardIssue ("is blocked by").
+    let inwardKey = sourceIssueKey;
+    let outwardKey = newIssueKey;
+
+    if (relationType === 'is_blocked_by') {
+      // newIssueKey is blocked by sourceIssueKey -> sourceIssueKey blocks newIssueKey
+      inwardKey = sourceIssueKey;
+      outwardKey = newIssueKey;
+    } else if (relationType === 'blocks') {
+      // newIssueKey blocks sourceIssueKey
+      inwardKey = newIssueKey;
+      outwardKey = sourceIssueKey;
+    } else if (relationType === 'cloners') {
+      // newIssueKey clones sourceIssueKey
+      inwardKey = newIssueKey;
+      outwardKey = sourceIssueKey;
+    }
+
+    const linkRes = await fetch(`https://${domain}/rest/api/3/issueLink`, {
+      method: 'POST',
+      headers: {
+        Authorization: authHeader,
+        'Content-Type': 'application/json',
+        Accept: 'application/json',
+      },
+      body: JSON.stringify({
+        type: { name: chosenTypeName },
+        inwardIssue: { key: inwardKey },
+        outwardIssue: { key: outwardKey },
+      }),
+    });
+
+    if (linkRes.ok) {
+      return { linked: true, linkTypeName: chosenTypeName };
+    } else {
+      const errTxt = await linkRes.text().catch(() => '');
+      console.warn(`[Jira IssueLink] Could not link ${newIssueKey} <-> ${sourceIssueKey} (${linkRes.status}):`, errTxt);
+      return { linked: false, warning: `No se pudo vincular con ${sourceIssueKey} (${linkRes.status})` };
+    }
+  } catch (err: any) {
+    console.warn('[Jira IssueLink] Error linking issues:', err);
+    return { linked: false, warning: err?.message };
+  }
+}
+
+// Endpoint: Fetch Active Epics from Jira Project (Funcionalidad 4)
+app.post('/api/jira/epics', async (req: Request, res: Response) => {
+  try {
+    const { jiraConfig } = req.body;
+    const isSimulation = jiraConfig?.simulationMode !== false;
+    const projectKey = (jiraConfig?.projectKey || 'PAY').trim().toUpperCase();
+
+    if (!isSimulation && jiraConfig?.domain && jiraConfig?.userEmail && jiraConfig?.apiToken) {
+      try {
+        const cleanDomain = jiraConfig.domain.trim().replace(/^https?:\/\//, '').replace(/\/$/, '');
+        const authHeader =
+          'Basic ' + Buffer.from(`${jiraConfig.userEmail.trim()}:${jiraConfig.apiToken.trim()}`).toString('base64');
+
+        const jql = `project = "${projectKey}" AND issuetype IN ("Epic", "Épica") AND statusCategory != Done ORDER BY updated DESC`;
+
+        let jiraRes = await fetch(`https://${cleanDomain}/rest/api/3/search/jql`, {
+          method: 'POST',
+          headers: {
+            Authorization: authHeader,
+            Accept: 'application/json',
+            'Content-Type': 'application/json',
+          },
+          body: JSON.stringify({
+            jql,
+            maxResults: 50,
+            fields: ['summary', 'status'],
+          }),
+        });
+
+        if (!jiraRes.ok && jiraRes.status === 405) {
+          jiraRes = await fetch(
+            `https://${cleanDomain}/rest/api/3/search/jql?jql=${encodeURIComponent(jql)}&maxResults=50&fields=summary,status`,
+            {
+              headers: {
+                Authorization: authHeader,
+                Accept: 'application/json',
+              },
+            }
+          );
+        }
+
+        if (jiraRes.ok) {
+          const data = (await jiraRes.json()) as any;
+          if (Array.isArray(data.issues)) {
+            const epics = data.issues.map((i: any) => ({
+              key: i.key,
+              summary: i.fields?.summary || i.key,
+              status: i.fields?.status?.name || 'En Progreso',
+            }));
+            return res.json({
+              success: true,
+              epics,
+              mode: 'live-jira',
+            });
+          }
+        }
+      } catch (err) {
+        console.warn('[Jira Epics] Error fetching live epics from Jira Cloud:', err);
+      }
+    }
+
+    // Fallback / Simulation mode Epics
+    const simulatedEpics = [
+      {
+        key: `${projectKey}-10`,
+        summary: 'Arquitectura Centralizada Business Dims & Tablas Externas CDP',
+        status: 'In Progress',
+      },
+      {
+        key: `${projectKey}-11`,
+        summary: 'Modernización de Pipelines Airflow & Observabilidad',
+        status: 'In Progress',
+      },
+      {
+        key: `${projectKey}-12`,
+        summary: 'Gobierno de Datos, Contratos & Calidad en Capa 40',
+        status: 'To Do',
+      },
+    ];
+
+    return res.json({
+      success: true,
+      epics: simulatedEpics,
+      mode: 'simulation',
+    });
+  } catch (err: any) {
+    console.error('Error in /api/jira/epics:', err);
+    res.status(500).json({ error: 'Error obteniendo épicas del proyecto en Jira.' });
+  }
+});
+
+// Helper to build structured Atlassian Document Format (ADF) for comments with Acceptance Criteria
+const buildCommentAdf = (rawComment: string) => {
+  const lines = rawComment.split(/\r?\n/);
+  const contentNodes: any[] = [];
+  let inCriteriaList = false;
+  let criteriaItems: string[] = [];
+  let currentParagraphLines: string[] = [];
+
+  const flushParagraph = () => {
+    if (currentParagraphLines.length > 0) {
+      contentNodes.push({
+        type: 'paragraph',
+        content: [
+          {
+            type: 'text',
+            text: currentParagraphLines.join('\n'),
+          },
+        ],
+      });
+      currentParagraphLines = [];
+    }
+  };
+
+  const flushCriteriaList = () => {
+    if (criteriaItems.length > 0) {
+      contentNodes.push({
+        type: 'bulletList',
+        content: criteriaItems.map((itemText) => ({
+          type: 'listItem',
+          content: [
+            {
+              type: 'paragraph',
+              content: [{ type: 'text', text: itemText }],
+            },
+          ],
+        })),
+      });
+      criteriaItems = [];
+    }
+  };
+
+  for (const line of lines) {
+    const trimmed = line.trim();
+    if (!trimmed) {
+      flushParagraph();
+      continue;
+    }
+
+    if (/^criterios de aceptaci[oó]n/i.test(trimmed)) {
+      flushParagraph();
+      flushCriteriaList();
+      contentNodes.push({
+        type: 'paragraph',
+        content: [
+          {
+            type: 'text',
+            text: trimmed,
+            marks: [{ type: 'strong' }],
+          },
+        ],
+      });
+      inCriteriaList = true;
+      continue;
+    }
+
+    if (inCriteriaList) {
+      const cleanCriterion = trimmed.replace(/^[-*•\d+.\s]+/, '').trim() || trimmed;
+      criteriaItems.push(cleanCriterion);
+    } else {
+      currentParagraphLines.push(trimmed);
+    }
+  }
+
+  flushParagraph();
+  flushCriteriaList();
+
+  if (contentNodes.length === 0) {
+    contentNodes.push({
+      type: 'paragraph',
+      content: [{ type: 'text', text: rawComment }],
+    });
+  }
+
+  return {
+    body: {
+      type: 'doc',
+      version: 1,
+      content: contentNodes,
+    },
+  };
+};
+
+// Endpoint: Add or Update Comment on an Existing Jira Issue
 app.post('/api/jira/add-comment', async (req: Request, res: Response) => {
   try {
-    const { issueKey, comment, jiraConfig } = req.body;
+    const { issueKey, comment, jiraConfig, commentId } = req.body;
 
     if (!issueKey || !comment || typeof comment !== 'string' || !comment.trim()) {
       return res.status(400).json({ error: 'Faltan issueKey o comment.' });
@@ -1304,42 +1605,47 @@ app.post('/api/jira/add-comment', async (req: Request, res: Response) => {
 
       const domain = jiraConfig.domain.trim().replace(/^https?:\/\//, '').replace(/\/$/, '');
       const authHeader = 'Basic ' + Buffer.from(`${jiraConfig.userEmail.trim()}:${jiraConfig.apiToken.trim()}`).toString('base64');
+      const adfBody = buildCommentAdf(cleanComment);
 
-      // Jira Cloud REST API v3 requires Atlassian Document Format (ADF)
-      const adfBody = {
-        body: {
-          type: 'doc',
-          version: 1,
-          content: [
-            {
-              type: 'paragraph',
-              content: [
-                {
-                  type: 'text',
-                  text: cleanComment,
-                },
-              ],
+      const targetCommentId = commentId && !String(commentId).startsWith('sim-') ? String(commentId).trim() : null;
+
+      let jiraRes: any = null;
+
+      // If existing commentId is provided, attempt to update it directly in Jira Cloud (avoiding duplicates)
+      if (targetCommentId) {
+        jiraRes = await fetch(
+          `https://${domain}/rest/api/3/issue/${encodeURIComponent(cleanKey)}/comment/${encodeURIComponent(targetCommentId)}`,
+          {
+            method: 'PUT',
+            headers: {
+              'Authorization': authHeader,
+              'Content-Type': 'application/json',
+              'Accept': 'application/json',
             },
-          ],
-        },
-      };
+            body: JSON.stringify(adfBody),
+          }
+        );
+      }
 
-      const jiraRes = await fetch(
-        `https://${domain}/rest/api/3/issue/${encodeURIComponent(cleanKey)}/comment`,
-        {
-          method: 'POST',
-          headers: {
-            'Authorization': authHeader,
-            'Content-Type': 'application/json',
-            'Accept': 'application/json',
-          },
-          body: JSON.stringify(adfBody),
-        }
-      );
+      // If no commentId or PUT returned 404 (comment was removed), create as new comment
+      if (!jiraRes || (!jiraRes.ok && jiraRes.status === 404)) {
+        jiraRes = await fetch(
+          `https://${domain}/rest/api/3/issue/${encodeURIComponent(cleanKey)}/comment`,
+          {
+            method: 'POST',
+            headers: {
+              'Authorization': authHeader,
+              'Content-Type': 'application/json',
+              'Accept': 'application/json',
+            },
+            body: JSON.stringify(adfBody),
+          }
+        );
+      }
 
       if (!jiraRes.ok) {
         const errText = await jiraRes.text();
-        console.error(`[Jira Add Comment] Error ${jiraRes.status} on ${cleanKey}:`, errText);
+        console.error(`[Jira Add/Update Comment] Error ${jiraRes.status} on ${cleanKey}:`, errText);
         return res.status(jiraRes.status).json({
           success: false,
           error: `Jira devolvió error ${jiraRes.status}: ${errText.slice(0, 200)}`,
@@ -1350,7 +1656,7 @@ app.post('/api/jira/add-comment', async (req: Request, res: Response) => {
       return res.json({
         success: true,
         issueKey: cleanKey,
-        commentId: data.id,
+        commentId: data.id || targetCommentId,
         mode: 'live-jira',
         addedAt: new Date().toISOString(),
       });
@@ -1360,13 +1666,253 @@ app.post('/api/jira/add-comment', async (req: Request, res: Response) => {
     return res.json({
       success: true,
       issueKey: cleanKey,
-      commentId: 'sim-comm-' + Date.now(),
+      commentId: commentId || ('sim-comm-' + Date.now()),
       mode: 'simulation',
       addedAt: new Date().toISOString(),
     });
   } catch (err: any) {
     console.error('Error in /api/jira/add-comment:', err);
     res.status(500).json({ error: err?.message || 'Error al agregar comentario en Jira.' });
+  }
+});
+
+// Endpoint: Update an Existing Jira Issue (Summary, Description, Acceptance Criteria, Priority, Assignee, Labels)
+app.post('/api/jira/update-issue', async (req: Request, res: Response) => {
+  try {
+    const { issueKey, actionItem, jiraConfig, jiraUsers } = req.body;
+
+    if (!issueKey || !actionItem) {
+      return res.status(400).json({ error: 'Faltan issueKey o actionItem.' });
+    }
+
+    const cleanKey = String(issueKey).trim().toUpperCase();
+    const isLiveJira = jiraConfig?.simulationMode === false;
+
+    if (isLiveJira) {
+      if (!jiraConfig?.domain || !jiraConfig?.userEmail || !jiraConfig?.apiToken) {
+        return res.status(400).json({
+          success: false,
+          error: 'Modo simulación desactivado pero faltan credenciales de Jira Cloud en Ajustes.',
+        });
+      }
+
+      const domain = jiraConfig.domain.trim().replace(/^https?:\/\//, '').replace(/\/$/, '');
+      const authHeader = 'Basic ' + Buffer.from(`${jiraConfig.userEmail.trim()}:${jiraConfig.apiToken.trim()}`).toString('base64');
+
+      // Discover Assignee accountId in Jira Cloud if assigned
+      let matchingAccountId: string | null = null;
+      const rawAssignee = (actionItem.assignee || '').trim();
+      const cleanAssigneeName = rawAssignee.replace(/\s*\([^)]*\)/g, '').trim();
+
+      if (cleanAssigneeName && cleanAssigneeName.toLowerCase() !== 'sin asignar') {
+        const knownUsers: any[] = jiraUsers || jiraConfig?.jiraUsers || [];
+        const foundLocal = knownUsers.find((u: any) => {
+          const dn = (u.displayName || '').toLowerCase();
+          const em = (u.emailAddress || '').toLowerCase();
+          const query = cleanAssigneeName.toLowerCase();
+          return dn === query || dn.includes(query) || query.includes(dn) || em.startsWith(query);
+        });
+
+        if (foundLocal?.accountId && !foundLocal.accountId.startsWith('jira-usr-')) {
+          matchingAccountId = foundLocal.accountId;
+        } else {
+          try {
+            const projectKey = cleanKey.split('-')[0];
+            const userSearchRes = await fetch(
+              `https://${domain}/rest/api/3/user/assignable/search?project=${encodeURIComponent(projectKey)}&query=${encodeURIComponent(cleanAssigneeName)}`,
+              {
+                headers: {
+                  'Authorization': authHeader,
+                  'Accept': 'application/json',
+                },
+              }
+            );
+            if (userSearchRes.ok) {
+              const searchResults = (await userSearchRes.json()) as any[];
+              if (Array.isArray(searchResults) && searchResults.length > 0) {
+                const exact = searchResults.find((u: any) =>
+                  u.displayName?.toLowerCase().includes(cleanAssigneeName.toLowerCase()) ||
+                  cleanAssigneeName.toLowerCase().includes(u.displayName?.toLowerCase())
+                );
+                const selectedUser = exact || searchResults[0];
+                if (selectedUser?.accountId) {
+                  matchingAccountId = selectedUser.accountId;
+                }
+              }
+            }
+          } catch (userErr) {
+            console.warn('Error querying Jira assignable users for update:', userErr);
+          }
+        }
+      }
+
+      // Build ADF Description including updated criteria and technical context
+      const descContent: any[] = [];
+      const mainDesc = (actionItem.description || '').trim();
+      if (mainDesc) {
+        descContent.push({
+          type: 'paragraph',
+          content: [{ type: 'text', text: mainDesc }],
+        });
+      }
+
+      const techContext = (actionItem.technicalContext || '').trim();
+      if (techContext) {
+        descContent.push({
+          type: 'paragraph',
+          content: [{ type: 'text', text: `Contexto Reunión Teams:\n${techContext}` }],
+        });
+      }
+
+      const criteria = Array.isArray(actionItem.acceptanceCriteria)
+        ? actionItem.acceptanceCriteria.map((c: string) => String(c).trim()).filter(Boolean)
+        : [];
+
+      if (criteria.length > 0) {
+        descContent.push({
+          type: 'heading',
+          attrs: { level: 3 },
+          content: [{ type: 'text', text: 'Criterios de Aceptación' }],
+        });
+        descContent.push({
+          type: 'bulletList',
+          content: criteria.map((crit: string) => ({
+            type: 'listItem',
+            content: [{ type: 'paragraph', content: [{ type: 'text', text: crit }] }],
+          })),
+        });
+      }
+
+      if (descContent.length === 0) {
+        descContent.push({
+          type: 'paragraph',
+          content: [{ type: 'text', text: actionItem.title || 'Actualizado desde ProyectHandler' }],
+        });
+      }
+
+      const buildUpdatePayload = (
+        withAssignee: boolean = true,
+        withPriority: boolean = true,
+        withParent: boolean = true
+      ) => {
+        const payload: any = {
+          fields: {
+            summary: (actionItem.title || '').trim(),
+            description: {
+              type: 'doc',
+              version: 1,
+              content: descContent,
+            },
+            labels: actionItem.jiraLabels || [],
+          },
+        };
+
+        if (withPriority && actionItem.priority) {
+          payload.fields.priority = { name: actionItem.priority };
+        }
+
+        if (withAssignee && matchingAccountId) {
+          payload.fields.assignee = { accountId: matchingAccountId };
+        }
+
+        if (withParent && actionItem.epicKey && String(actionItem.epicKey).trim()) {
+          payload.fields.parent = { key: String(actionItem.epicKey).trim().toUpperCase() };
+        }
+
+        return payload;
+      };
+
+      let response = await fetch(`https://${domain}/rest/api/3/issue/${encodeURIComponent(cleanKey)}`, {
+        method: 'PUT',
+        headers: {
+          'Authorization': authHeader,
+          'Content-Type': 'application/json',
+          'Accept': 'application/json',
+        },
+        body: JSON.stringify(buildUpdatePayload(true, true, true)),
+      });
+
+      // If rejected, check if due to parent, assignee or priority
+      if (!response.ok) {
+        const errText = await response.text();
+        console.warn(`[Jira Update Issue] Response ${response.status} on ${cleanKey}:`, errText);
+
+        if (errText.includes('parent') || errText.includes('hierarchy')) {
+          response = await fetch(`https://${domain}/rest/api/3/issue/${encodeURIComponent(cleanKey)}`, {
+            method: 'PUT',
+            headers: {
+              'Authorization': authHeader,
+              'Content-Type': 'application/json',
+              'Accept': 'application/json',
+            },
+            body: JSON.stringify(buildUpdatePayload(true, true, false)),
+          });
+        } else if (errText.includes('assignee')) {
+          response = await fetch(`https://${domain}/rest/api/3/issue/${encodeURIComponent(cleanKey)}`, {
+            method: 'PUT',
+            headers: {
+              'Authorization': authHeader,
+              'Content-Type': 'application/json',
+              'Accept': 'application/json',
+            },
+            body: JSON.stringify(buildUpdatePayload(false, true, false)),
+          });
+        } else if (errText.includes('priority')) {
+          response = await fetch(`https://${domain}/rest/api/3/issue/${encodeURIComponent(cleanKey)}`, {
+            method: 'PUT',
+            headers: {
+              'Authorization': authHeader,
+              'Content-Type': 'application/json',
+              'Accept': 'application/json',
+            },
+            body: JSON.stringify(buildUpdatePayload(true, false, false)),
+          });
+        }
+
+        if (!response.ok) {
+          const finalErrText = await response.text();
+          let parsedError = '';
+          try {
+            const errJson = JSON.parse(finalErrText);
+            parsedError = errJson.errorMessages?.join(', ') || Object.values(errJson.errors || {}).join(', ');
+          } catch {
+            parsedError = finalErrText;
+          }
+          return res.status(400).json({
+            success: false,
+            error: `Jira Cloud (${cleanKey}) rechazó la actualización: ${parsedError || 'Verifica los campos y permisos.'}`,
+          });
+        }
+      }
+
+      return res.json({
+        success: true,
+        issueKey: cleanKey,
+        issueUrl: `https://${domain}/browse/${cleanKey}`,
+        mode: 'live-jira',
+        updatedAt: new Date().toISOString(),
+      });
+    }
+
+    // Simulation mode
+    return res.json({
+      success: true,
+      issueKey: cleanKey,
+      issueUrl: `https://${(jiraConfig?.domain || 'civicasoftware.atlassian.net').replace(/^https?:\/\//, '').replace(/\/$/, '')}/browse/${cleanKey}`,
+      mode: 'simulation',
+      updatedAt: new Date().toISOString(),
+      details: {
+        summary: actionItem.title,
+        description: actionItem.description,
+        acceptanceCriteria: actionItem.acceptanceCriteria,
+        priority: actionItem.priority,
+        assignee: actionItem.assignee,
+        labels: actionItem.jiraLabels,
+      },
+    });
+  } catch (error: any) {
+    console.error('Error in /api/jira/update-issue:', error);
+    res.status(500).json({ error: error?.message || 'Error al actualizar el ticket en Jira.' });
   }
 });
 
@@ -1579,7 +2125,54 @@ app.post('/api/jira/create-issue', async (req: Request, res: Response) => {
           }
         }
 
-        const buildJiraPayload = (typeName: string, withAssignee: boolean = true) => {
+        const buildJiraPayload = (
+          typeName: string,
+          withAssignee: boolean = true,
+          withParent: boolean = true
+        ) => {
+          const descContent: any[] = [];
+          const mainDesc = (actionItem.description || '').trim();
+          if (mainDesc) {
+            descContent.push({
+              type: 'paragraph',
+              content: [{ type: 'text', text: mainDesc }],
+            });
+          }
+
+          const techContext = (actionItem.technicalContext || '').trim();
+          if (techContext) {
+            descContent.push({
+              type: 'paragraph',
+              content: [{ type: 'text', text: `Contexto Reunión Teams:\n${techContext}` }],
+            });
+          }
+
+          const criteria = Array.isArray(actionItem.acceptanceCriteria)
+            ? actionItem.acceptanceCriteria.map((crit: string) => String(crit).trim()).filter(Boolean)
+            : [];
+
+          if (criteria.length > 0) {
+            descContent.push({
+              type: 'heading',
+              attrs: { level: 3 },
+              content: [{ type: 'text', text: 'Criterios de Aceptación' }],
+            });
+            descContent.push({
+              type: 'bulletList',
+              content: criteria.map((crit: string) => ({
+                type: 'listItem',
+                content: [{ type: 'paragraph', content: [{ type: 'text', text: crit }] }],
+              })),
+            });
+          }
+
+          if (descContent.length === 0) {
+            descContent.push({
+              type: 'paragraph',
+              content: [{ type: 'text', text: actionItem.title || 'Generado desde ProyectHandler' }],
+            });
+          }
+
           const payload: any = {
             fields: {
               project: { key: projectKey },
@@ -1587,26 +2180,7 @@ app.post('/api/jira/create-issue', async (req: Request, res: Response) => {
               description: {
                 type: 'doc',
                 version: 1,
-                content: [
-                  {
-                    type: 'paragraph',
-                    content: [
-                      { type: 'text', text: `Contexto Reunión Teams:\n${actionItem.description || actionItem.technicalContext || ''}\n\nResponsable Asignado en ProyectHandler: ${actionItem.assignee}\nTema: ${actionItem.topicName || ''}` }
-                    ]
-                  },
-                  {
-                    type: 'heading',
-                    attrs: { level: 3 },
-                    content: [{ type: 'text', text: 'Criterios de Aceptación' }]
-                  },
-                  {
-                    type: 'bulletList',
-                    content: (actionItem.acceptanceCriteria || []).map((crit: string) => ({
-                      type: 'listItem',
-                      content: [{ type: 'paragraph', content: [{ type: 'text', text: crit }] }]
-                    }))
-                  }
-                ]
+                content: descContent,
               },
               issuetype: { name: typeName },
               priority: { name: actionItem.priority || 'Medium' },
@@ -1616,6 +2190,10 @@ app.post('/api/jira/create-issue', async (req: Request, res: Response) => {
 
           if (withAssignee && matchingAccountId) {
             payload.fields.assignee = { accountId: matchingAccountId };
+          }
+
+          if (withParent && actionItem.epicKey && String(actionItem.epicKey).trim()) {
+            payload.fields.parent = { key: String(actionItem.epicKey).trim().toUpperCase() };
           }
 
           return payload;
@@ -1628,13 +2206,27 @@ app.post('/api/jira/create-issue', async (req: Request, res: Response) => {
             'Content-Type': 'application/json',
             'Accept': 'application/json'
           },
-          body: JSON.stringify(buildJiraPayload(resolvedIssueTypeName, true)),
+          body: JSON.stringify(buildJiraPayload(resolvedIssueTypeName, true, true)),
         });
 
-        // If rejected, check if issue was due to assignee or issuetype
+        // If rejected, check if issue was due to parent, assignee or issuetype
         if (!response.ok) {
           const errText = await response.text();
-          if (errText.includes('assignee')) {
+          if (errText.includes('parent') || errText.includes('hierarchy')) {
+            console.warn(`[Jira Parent Epic] Could not set parent ${actionItem.epicKey}, retrying without parent:`, errText);
+            const retryWithoutParent = await fetch(`https://${domain}/rest/api/3/issue`, {
+              method: 'POST',
+              headers: {
+                'Authorization': authHeader,
+                'Content-Type': 'application/json',
+                'Accept': 'application/json'
+              },
+              body: JSON.stringify(buildJiraPayload(resolvedIssueTypeName, true, false)),
+            });
+            if (retryWithoutParent.ok) {
+              response = retryWithoutParent;
+            }
+          } else if (errText.includes('assignee')) {
             console.warn(`[Jira Assignee] Could not assign ${cleanAssigneeName}, retrying unassigned:`, errText);
             const retryUnassigned = await fetch(`https://${domain}/rest/api/3/issue`, {
               method: 'POST',
@@ -1643,7 +2235,7 @@ app.post('/api/jira/create-issue', async (req: Request, res: Response) => {
                 'Content-Type': 'application/json',
                 'Accept': 'application/json'
               },
-              body: JSON.stringify(buildJiraPayload(resolvedIssueTypeName, false)),
+              body: JSON.stringify(buildJiraPayload(resolvedIssueTypeName, false, false)),
             });
             if (retryUnassigned.ok) {
               response = retryUnassigned;
@@ -1657,46 +2249,58 @@ app.post('/api/jira/create-issue', async (req: Request, res: Response) => {
                 'Content-Type': 'application/json',
                 'Accept': 'application/json'
               },
-              body: JSON.stringify(buildJiraPayload(alternateType, true)),
+              body: JSON.stringify(buildJiraPayload(alternateType, true, false)),
             });
             if (retryRes.ok) {
               response = retryRes;
             }
           }
 
-          if (response.ok) {
-            const data = (await response.json()) as any;
-            return res.json({
-              success: true,
-              issueKey: data.key,
-              issueUrl: `https://${domain}/browse/${data.key}`,
-              mode: 'live-jira',
-              syncedAt: new Date().toISOString(),
+          if (!response.ok) {
+            // Real error: explain clearly to user instead of pretending it succeeded in simulation
+            let parsedError = '';
+            try {
+              const errJson = JSON.parse(errText);
+              parsedError = errJson.errorMessages?.join(', ') || Object.values(errJson.errors || {}).join(', ');
+            } catch {
+              parsedError = errText;
+            }
+
+            return res.status(400).json({
+              success: false,
+              error: `Jira Cloud (${projectKey}) rechazó la creación: ${parsedError || 'Verifica los permisos o tipo de incidencia de tu proyecto.'}`,
             });
           }
-
-          // Real error: explain clearly to user instead of pretending it succeeded in simulation
-          let parsedError = '';
-          try {
-            const errJson = JSON.parse(errText);
-            parsedError = errJson.errorMessages?.join(', ') || Object.values(errJson.errors || {}).join(', ');
-          } catch {
-            parsedError = errText;
-          }
-
-          return res.status(400).json({
-            success: false,
-            error: `Jira Cloud (${projectKey}) rechazó la creación: ${parsedError || 'Verifica los permisos o tipo de incidencia de tu proyecto.'}`,
-          });
         }
 
         const data = (await response.json()) as any;
+        const createdKey = data.key;
+
+        // Funcionalidad 1: Execute native Jira Issue Link if requested
+        let linkResult: { linked: boolean; linkTypeName?: string; warning?: string } | undefined;
+        const linkToIssue = req.body.linkToIssue;
+        if (
+          linkToIssue &&
+          linkToIssue.sourceKey &&
+          linkToIssue.linkType &&
+          linkToIssue.linkType !== 'none'
+        ) {
+          linkResult = await linkJiraIssuesInCloud(
+            domain,
+            authHeader,
+            createdKey,
+            String(linkToIssue.sourceKey).trim().toUpperCase(),
+            linkToIssue.linkType
+          );
+        }
+
         return res.json({
           success: true,
-          issueKey: data.key,
-          issueUrl: `https://${domain}/browse/${data.key}`,
+          issueKey: createdKey,
+          issueUrl: `https://${domain}/browse/${createdKey}`,
           mode: 'live-jira',
           syncedAt: new Date().toISOString(),
+          linkResult,
         });
       } catch (jiraErr: any) {
         console.error('Jira network error:', jiraErr);
@@ -1708,12 +2312,17 @@ app.post('/api/jira/create-issue', async (req: Request, res: Response) => {
     }
 
     // Smart simulated creation (only if simulation mode is active)
+    const simLink = req.body.linkToIssue;
     return res.json({
       success: true,
       issueKey,
       issueUrl,
       mode: 'simulation',
       syncedAt: new Date().toISOString(),
+      linkResult:
+        simLink && simLink.sourceKey && simLink.linkType && simLink.linkType !== 'none'
+          ? { linked: true, linkTypeName: simLink.linkType }
+          : undefined,
       details: {
         summary: actionItem.title,
         assignee: actionItem.assignee,
@@ -2206,6 +2815,103 @@ app.post('/api/confluence/publish', async (req: Request, res: Response) => {
   } catch (err: any) {
     console.error('Error in /api/confluence/publish:', err);
     res.status(500).json({ error: 'Error publicando en Confluence.' });
+  }
+});
+
+// ============================================================================
+// Agnostic Database API Endpoints
+// ============================================================================
+
+// Endpoint: Test connection to configured agnostic database
+app.post('/api/db/test-connection', async (req: Request, res: Response) => {
+  try {
+    const config: DatabaseConfig = req.body;
+    const result = await agnosticDb.testConnection(config);
+    return res.json(result);
+  } catch (err: any) {
+    console.error('Error testing agnostic database connection:', err);
+    return res.status(500).json({
+      success: false,
+      latencyMs: 0,
+      engine: req.body?.type || 'none',
+      message: 'Fallo al ejecutar la prueba de conexión con la base de datos.',
+      error: err.message,
+    });
+  }
+});
+
+// Endpoint: Check for environment-based database configuration
+app.get('/api/db/env-config', (_req: Request, res: Response) => {
+  const envUrl = process.env.DATABASE_URL || '';
+  const envType = process.env.DATABASE_TYPE || (envUrl ? 'postgres' : 'none');
+  const envSnowflakeAccount = process.env.SNOWFLAKE_ACCOUNT || '';
+  const hasEnvDb = Boolean(envUrl || (envType && envType !== 'none') || envSnowflakeAccount);
+
+  return res.json({
+    hasEnvDb,
+    envDbType: envType,
+    hasConnectionString: Boolean(envUrl),
+    snowflakeAccount: envSnowflakeAccount ? envSnowflakeAccount.replace(/(.{2}).+(.{2})/, '$1***$2') : undefined,
+  });
+});
+
+// Endpoint: Read collection from agnostic database
+app.post('/api/db/data', async (req: Request, res: Response) => {
+  try {
+    const { config, collection } = req.body;
+    if (!collection) {
+      return res.status(400).json({ error: 'Falta especificar la colección o tabla solicitada.' });
+    }
+    const data = await agnosticDb.getData(config || { enabled: false, type: 'none' }, collection);
+    return res.json({ success: true, collection, data });
+  } catch (err: any) {
+    console.error('Error getting data from agnostic database:', err);
+    return res.status(500).json({ error: 'Error al recuperar datos de la base de datos.' });
+  }
+});
+
+// Endpoint: Save single document or entity to agnostic database
+app.post('/api/db/save', async (req: Request, res: Response) => {
+  try {
+    const { config, collection, key, data } = req.body;
+    if (!collection || !key) {
+      return res.status(400).json({ error: 'Faltan parámetros requeridos (collection, key).' });
+    }
+    const ok = await agnosticDb.saveItem(config || { enabled: false, type: 'none' }, collection, key, data);
+    return res.json({ success: ok, collection, key });
+  } catch (err: any) {
+    console.error('Error saving item to agnostic database:', err);
+    return res.status(500).json({ error: 'Error al persistir el elemento en la base de datos.' });
+  }
+});
+
+// Endpoint: Delete document or entity from agnostic database
+app.post('/api/db/delete', async (req: Request, res: Response) => {
+  try {
+    const { config, collection, key } = req.body;
+    if (!collection || !key) {
+      return res.status(400).json({ error: 'Faltan parámetros requeridos (collection, key).' });
+    }
+    const ok = await agnosticDb.deleteItem(config || { enabled: false, type: 'none' }, collection, key);
+    return res.json({ success: ok, collection, key });
+  } catch (err: any) {
+    console.error('Error deleting item from agnostic database:', err);
+    return res.status(500).json({ error: 'Error al eliminar el elemento de la base de datos.' });
+  }
+});
+
+// Endpoint: Bulk migrate local data (localStorage) to agnostic database
+app.post('/api/db/migrate', async (req: Request, res: Response) => {
+  try {
+    const { config, payload } = req.body;
+    if (!payload) {
+      return res.status(400).json({ error: 'Falta la carga de datos para migrar.' });
+    }
+    const result = await agnosticDb.bulkMigrate(config || { enabled: false, type: 'none' }, payload);
+    return res.json(result);
+  } catch (err: any) {
+    console.error('Error during bulk migration to database:', err);
+    return res.status(500).json({ error: 'Error durante la migración a la base de datos.' });
   }
 });
 

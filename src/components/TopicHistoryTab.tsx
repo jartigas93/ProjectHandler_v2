@@ -28,6 +28,7 @@ import {
 import { TopicHistoryRecord, TopicStatus, JiraUser } from '../types';
 import { exportTopicsToCsv, downloadFile } from '../utils/exportUtils';
 import { DEFAULT_TOPIC_CATEGORIES, DEFAULT_JIRA_USERS } from '../utils/storage';
+import { AutoResizeTextarea } from './AutoResizeTextarea';
 
 interface TopicHistoryTabProps {
   topics: TopicHistoryRecord[];
@@ -278,11 +279,10 @@ export const TopicHistoryTab: React.FC<TopicHistoryTabProps> = ({
             <button
               key={st}
               onClick={() => setStatusFilter(st)}
-              className={`px-3 py-1.5 rounded-lg text-xs font-semibold whitespace-nowrap transition-all ${
-                statusFilter === st
+              className={`px-3 py-1.5 rounded-lg text-xs font-semibold whitespace-nowrap transition-all ${statusFilter === st
                   ? 'bg-gradient-to-r from-[#FF5038] to-[#EE880E] text-white shadow-xs'
                   : 'bg-[#25282B] text-slate-300 hover:bg-[#2F3236]'
-              }`}
+                }`}
             >
               {st === 'all' ? `Todos (${topics.length})` : st}
             </button>
@@ -368,13 +368,12 @@ export const TopicHistoryTab: React.FC<TopicHistoryTabProps> = ({
                       </div>
                       <div className="w-full bg-slate-950 rounded-full h-2 overflow-hidden border border-slate-800">
                         <div
-                          className={`h-full rounded-full transition-all duration-300 ${
-                            topic.progressPercent === 100
+                          className={`h-full rounded-full transition-all duration-300 ${topic.progressPercent === 100
                               ? 'bg-emerald-500'
                               : topic.status === 'Bloqueado'
-                              ? 'bg-rose-500'
-                              : 'bg-indigo-500'
-                          }`}
+                                ? 'bg-rose-500'
+                                : 'bg-indigo-500'
+                            }`}
                           style={{ width: `${topic.progressPercent}%` }}
                         />
                       </div>
@@ -448,11 +447,10 @@ export const TopicHistoryTab: React.FC<TopicHistoryTabProps> = ({
                           <button
                             key={st}
                             onClick={() => handleStatusChange(topic, st)}
-                            className={`px-2.5 py-1 rounded-md text-[11px] font-semibold border transition-all ${
-                              topic.status === st
+                            className={`px-2.5 py-1 rounded-md text-[11px] font-semibold border transition-all ${topic.status === st
                                 ? getStatusBadge(st)
                                 : 'bg-slate-950 border-slate-800 text-slate-400 hover:text-white'
-                            }`}
+                              }`}
                           >
                             {st}
                           </button>
@@ -527,11 +525,10 @@ export const TopicHistoryTab: React.FC<TopicHistoryTabProps> = ({
                             return (
                               <div
                                 key={nIdx}
-                                className={`text-xs p-2.5 rounded-lg border leading-relaxed flex items-start gap-2.5 ${
-                                  isMeetingNote
+                                className={`text-xs p-2.5 rounded-lg border leading-relaxed flex items-start gap-2.5 ${isMeetingNote
                                     ? 'bg-slate-900/90 border-[#29E78C]/30 text-slate-200'
                                     : 'bg-slate-900 border-slate-800/80 text-slate-300'
-                                }`}
+                                  }`}
                               >
                                 {isMeetingNote ? (
                                   <Calendar className="w-3.5 h-3.5 text-[#29E78C] shrink-0 mt-0.5" />
@@ -666,8 +663,8 @@ export const TopicHistoryTab: React.FC<TopicHistoryTabProps> = ({
 
               <div>
                 <label className="block text-slate-400 font-medium mb-1">Resumen Inicial del Tema</label>
-                <textarea
-                  rows={3}
+                <AutoResizeTextarea
+                  minRows={3}
                   value={newTopicForm.initialSummary}
                   onChange={(e) => setNewTopicForm({ ...newTopicForm, initialSummary: e.target.value })}
                   placeholder="Descripción de objetivos o compromisos iniciales..."

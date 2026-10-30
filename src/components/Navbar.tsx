@@ -1,12 +1,13 @@
 import React from 'react';
-import { Calendar, CheckSquare, History, BarChart3, Settings, Sparkles, Sliders, FolderArchive } from 'lucide-react';
-import { JiraConfig } from '../types';
+import { Calendar, CheckSquare, History, BarChart3, Settings, Sparkles, Sliders, FolderArchive, HardDrive } from 'lucide-react';
+import { JiraConfig, DatabaseConfig } from '../types';
 import { ProyectHandlerBrand } from './CivicaLogo';
 
 interface NavbarProps {
   activeTab: 'transcript' | 'summary' | 'meetings' | 'history' | 'monthly';
   setActiveTab: (tab: 'transcript' | 'summary' | 'meetings' | 'history' | 'monthly') => void;
   jiraConfig: JiraConfig;
+  databaseConfig?: DatabaseConfig;
   onOpenJiraSettings: () => void;
   hasActiveMeeting: boolean;
   topicsCount: number;
@@ -17,6 +18,7 @@ export const Navbar: React.FC<NavbarProps> = ({
   activeTab,
   setActiveTab,
   jiraConfig,
+  databaseConfig,
   onOpenJiraSettings,
   hasActiveMeeting,
   topicsCount,
@@ -113,12 +115,39 @@ export const Navbar: React.FC<NavbarProps> = ({
             </button>
           </nav>
 
-          {/* Project & Jira Configuration Action */}
+          {/* Project & Storage Configuration Actions */}
           <div className="flex items-center gap-2">
+            {/* Storage Status Badge */}
+            <button
+              onClick={onOpenJiraSettings}
+              className="flex items-center gap-1.5 bg-[#25272A] hover:bg-[#2F3236] text-slate-200 border border-[#3E4247] px-2.5 py-1.5 rounded-xl text-xs font-semibold transition-all group cursor-pointer"
+              title={
+                databaseConfig?.enabled && databaseConfig.type !== 'none'
+                  ? `Persistencia activa en base de datos: ${databaseConfig.type.toUpperCase()}`
+                  : 'Almacenamiento Local (localStorage) activo. Sin base de datos externa.'
+              }
+            >
+              <HardDrive
+                className={`w-3.5 h-3.5 ${
+                  databaseConfig?.enabled && databaseConfig.type !== 'none'
+                    ? 'text-[#29E78C]'
+                    : 'text-slate-400 group-hover:text-[#EE880E]'
+                } transition-colors`}
+              />
+              <span className="text-[11px] font-mono text-slate-300 group-hover:text-white">
+                {databaseConfig?.enabled && databaseConfig.type !== 'none'
+                  ? databaseConfig.type.toUpperCase()
+                  : 'Local'}
+              </span>
+              {databaseConfig?.enabled && databaseConfig.type !== 'none' && (
+                <span className="w-1.5 h-1.5 rounded-full bg-[#29E78C] animate-pulse" />
+              )}
+            </button>
+
             <button
               onClick={onOpenJiraSettings}
               className="flex items-center gap-2 bg-[#25272A] hover:bg-[#2F3236] text-slate-200 border border-[#3E4247] px-3 py-1.5 rounded-xl text-xs font-semibold transition-all group cursor-pointer"
-              title="Configuración de Story Points, Categorías y Jira"
+              title="Configuración de Story Points, Categorías, Jira y Base de Datos"
             >
               <div className="flex items-center gap-1.5">
                 <span

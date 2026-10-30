@@ -26,16 +26,25 @@ import {
   Key,
   Eye,
   EyeOff,
-  Zap
+  Zap,
+  HardDrive,
+  Cloud,
+  UploadCloud,
+  DownloadCloud
 } from 'lucide-react';
-import { ProjectSettings, JiraConfig, JiraUser, IssueType, AIProvider, AIProviderConfig, AIModelOption } from '../types';
+import { ProjectSettings, JiraConfig, JiraUser, IssueType, AIProvider, AIProviderConfig, AIModelOption, DatabaseConfig, DatabaseType } from '../types';
 import {
   AVAILABLE_AI_MODELS,
   DEFAULT_AI_CONFIG,
+  DEFAULT_DATABASE_CONFIG,
   loadCustomAiModels,
   saveCustomAiModel,
   deleteCustomAiModel,
-  fetchFactoryAiModels
+  fetchFactoryAiModels,
+  testDatabaseConnection,
+  bulkMigrateLocalToDatabase,
+  importFromDatabaseToLocal,
+  fetchEnvDatabaseConfig
 } from '../utils/storage';
 import { CivicaIsotype } from './CivicaLogo';
 import { JiraUserAutocomplete } from './JiraUserAutocomplete';
@@ -48,7 +57,7 @@ interface ProjectConfigModalProps {
   onSave: (newSettings: ProjectSettings) => void;
 }
 
-type ConfigTab = 'storyPoints' | 'categories' | 'jiraUsers' | 'jiraConnection' | 'aiProviders';
+type ConfigTab = 'storyPoints' | 'categories' | 'jiraUsers' | 'jiraConnection' | 'aiProviders' | 'database';
 
 export const ProjectConfigModal: React.FC<ProjectConfigModalProps> = ({
   isOpen,
@@ -170,6 +179,172 @@ export const ProjectConfigModal: React.FC<ProjectConfigModalProps> = ({
 
   // Status toast
   const [saveSuccess, setSaveSuccess] = useState(false);
+
+  // Database Configuration State
+  const initialDb: DatabaseConfig = settings.database || DEFAULT_DATABASE_CONFIG;
+  const [dbEnabled, setDbEnabled] = useState<boolean>(initialDb.enabled);
+  const [dbType, setDbType] = useState<DatabaseType>(initialDb.type || 'none');
+  const [dbConnectionString, setDbConnectionString] = useState<string>(initialDb.connectionString || '');
+  const [dbHost, setDbHost] = useState<string>(initialDb.host || 'localhost');
+  const [dbPort, setDbPort] = useState<number>(initialDb.port || 5432);
+  const [dbName, setDbName] = useState<string>(initialDb.database || 'projecthandler');
+  const [dbUsername, setDbUsername] = useState<string>(initialDb.username || '');
+  const [dbPassword, setDbPassword] = useState<string>(initialDb.password || '');
+  const [dbSsl, setDbSsl] = useState<boolean>(initialDb.ssl || false);
+  const [dbAuthToken, setDbAuthToken] = useState<string>(initialDb.authToken || '');
+  const [dbSnowflakeAccount, setDbSnowflakeAccount] = useState<string>(initialDb.snowflakeAccount || '');
+  const [dbSnowflakeWarehouse, setDbSnowflakeWarehouse] = useState<string>(initialDb.snowflakeWarehouse || 'COMPUTE_WH');
+  const [dbSnowflakeSchema, setDbSnowflakeSchema] = useState<string>(initialDb.snowflakeSchema || 'PUBLIC');
+  const [dbSnowflakeRole, setDbSnowflakeRole] = useState<string>(initialDb.snowflakeRole || 'SYSADMIN');
+  const [dbTableName, setDbTableName] = useState<string>(initialDb.tableName || 'projecthandler_store');
+  const [dbAutoSync, setDbAutoSync] = useState<boolean>(initialDb.autoSync !== false);
+  const [useConnectionString, setUseConnectionString] = useState<boolean>(Boolean(initialDb.connectionString));
+
+  // DB Testing and Migration state
+  const [isTestingDb, setIsTestingDb] = useState<boolean>(false);
+  const [dbTestResult, setDbTestResult] = useState<{
+    success?: boolean;
+    latencyMs?: number;
+    engine?: string;
+    message?: string;
+    details?: any;
+    error?: string;
+  } | null>(null);
+  const [isMigratingDb, setIsMigratingDb] = useState<boolean>(false);
+  const [migrationStatus, setMigrationStatus] = useState<{ success?: boolean; message?: string } | null>(null);
+  const [isImportingDb, setIsImportingDb] = useState<boolean>(false);
+  const [importStatus, setImportStatus] = useState<{ success?: boolean; message?: string } | null>(null);
+  const [envDbInfo, setEnvDbInfo] = useState<{ hasEnvDb: boolean; envDbType: string; hasConnectionString: boolean; snowflakeAccount?: string } | null>(null);
+
+  useEffect(() => {
+    fetchEnvDatabaseConfig().then((info) => {
+      setEnvDbInfo(info);
+    });
+  }, []);
+
+  const normalizeSnowflakeAccount = (raw: string): string => {
+    let acc = raw
+      .replace(/^https?:\/\//i, '')
+      .replace(/\.snowflakecomputing\.com.*$/i, '')
+      .trim()
+      .toLowerCase();
+    if (acc.includes('.')) {
+      const parts = acc.split('.');
+      if (parts.length === 2 && !/^(us|eu|ap|ca|sa|me|af)-/i.test(parts[1])) {
+        acc = `${parts[0]}-${parts[1]}`;
+      }
+    }
+    return acc;
+  };
+
+  const getCurrentDbConfig = (): DatabaseConfig => {
+    let host = dbHost.trim();
+    let port = Number(dbPort) || 5432;
+
+    const normalizedSnowflakeAccount = normalizeSnowflakeAccount(dbSnowflakeAccount);
+
+    if (dbType === 'snowflake') {
+      host = normalizedSnowflakeAccount ? `${normalizedSnowflakeAccount}.snowflakecomputing.com` : '';
+      port = 443;
+    }
+
+    return {
+      enabled: dbEnabled && dbType !== 'none',
+      type: dbEnabled ? dbType : 'none',
+      connectionString: useConnectionString ? dbConnectionString.trim() : undefined,
+      host,
+      port,
+      database: dbName.trim(),
+      username: dbUsername.trim(),
+      password: dbPassword.trim(),
+      ssl: dbType === 'snowflake' ? true : dbSsl,
+      authToken: dbAuthToken.trim(),
+      snowflakeAccount: normalizedSnowflakeAccount || dbSnowflakeAccount.trim(),
+      snowflakeWarehouse: dbSnowflakeWarehouse.trim(),
+      snowflakeSchema: dbSnowflakeSchema.trim(),
+      snowflakeRole: dbSnowflakeRole.trim(),
+      tableName: dbTableName.trim() || 'projecthandler_store',
+      autoSync: dbAutoSync,
+    };
+  };
+
+  const handleTestDatabase = async () => {
+    setIsTestingDb(true);
+    setDbTestResult(null);
+    try {
+      const cfg = getCurrentDbConfig();
+      const res = await testDatabaseConnection(cfg);
+      setDbTestResult(res);
+    } catch (err: any) {
+      setDbTestResult({
+        success: false,
+        latencyMs: 0,
+        engine: dbType,
+        message: 'Error al contactar con el endpoint de prueba.',
+        error: err.message,
+      });
+    } finally {
+      setIsTestingDb(false);
+    }
+  };
+
+  const handleMigrateToDatabase = async () => {
+    setIsMigratingDb(true);
+    setMigrationStatus(null);
+    try {
+      const cfg = getCurrentDbConfig();
+      const res = await bulkMigrateLocalToDatabase(cfg);
+      if (res.success) {
+        const counts = res.migrated || {};
+        const countText = `${counts.meetings || 0} reuniones, ${counts.topics || 0} temas, ${counts.reports || 0} reportes`;
+        setMigrationStatus({
+          success: true,
+          message: `¡Migración completada con éxito! Se sincronizaron ${countText} a la base de datos remota.`,
+        });
+      } else {
+        setMigrationStatus({
+          success: false,
+          message: res.error || 'Fallo durante la migración de datos.',
+        });
+      }
+    } catch (err: any) {
+      setMigrationStatus({
+        success: false,
+        message: err.message || 'Error de red durante la migración.',
+      });
+    } finally {
+      setIsMigratingDb(false);
+    }
+  };
+
+  const handleImportFromDatabase = async () => {
+    setIsImportingDb(true);
+    setImportStatus(null);
+    try {
+      const cfg = getCurrentDbConfig();
+      const res = await importFromDatabaseToLocal(cfg);
+      if (res.success) {
+        setImportStatus({
+          success: true,
+          message: `¡Importación completada! Se descargaron ${res.importedCounts.meetings} reuniones y ${res.importedCounts.topics} temas.`,
+        });
+        window.dispatchEvent(new Event('teams2jira_local_storage_updated'));
+      } else {
+        setImportStatus({
+          success: false,
+          message: res.error || 'No se pudieron descargar los datos remotos.',
+        });
+      }
+    } catch (err: any) {
+      setImportStatus({
+        success: false,
+        message: err.message || 'Error de red durante la importación.',
+      });
+    } finally {
+      setIsImportingDb(false);
+    }
+  };
+
 
   // Handlers for Story Points Scale
   const handleAddStoryPoint = () => {
@@ -444,6 +619,8 @@ export const ProjectConfigModal: React.FC<ProjectConfigModalProps> = ({
       geminiApiKey: geminiApiKey.trim(),
     };
 
+    const updatedDatabase: DatabaseConfig = getCurrentDbConfig();
+
     const updatedSettings: ProjectSettings = {
       storyPointsScale: pointsScale,
       defaultStoryPoints: defaultPoints,
@@ -453,6 +630,7 @@ export const ProjectConfigModal: React.FC<ProjectConfigModalProps> = ({
       jiraUsers,
       jira: updatedJira,
       ai: updatedAi,
+      database: updatedDatabase,
     };
 
     onSave(updatedSettings);
@@ -549,6 +727,21 @@ export const ProjectConfigModal: React.FC<ProjectConfigModalProps> = ({
           >
             <Bot className="w-3.5 h-3.5" />
             <span>Modelos & Proveedores IA</span>
+          </button>
+
+          <button
+            onClick={() => setActiveTab('database')}
+            className={`flex items-center gap-1.5 px-3 py-2 rounded-xl transition-all whitespace-nowrap cursor-pointer ${
+              activeTab === 'database'
+                ? 'bg-gradient-to-r from-[#FF5038] to-[#EE880E] text-white shadow-xs'
+                : 'text-slate-400 hover:text-white hover:bg-[#222428]'
+            }`}
+          >
+            <HardDrive className="w-3.5 h-3.5" />
+            <span>Base de Datos</span>
+            {dbEnabled && dbType !== 'none' && (
+              <span className="w-1.5 h-1.5 rounded-full bg-[#29E78C] animate-pulse" />
+            )}
           </button>
         </div>
 
@@ -1650,6 +1843,544 @@ export const ProjectConfigModal: React.FC<ProjectConfigModalProps> = ({
                     <span>{isTestingAi ? 'Probando modelo...' : `Probar ${activeAiProvider.toUpperCase()}`}</span>
                   </button>
                 </div>
+              </div>
+            </div>
+          )}
+
+          {/* TAB 6: AGNOSTIC DATABASE CONFIGURATION */}
+          {activeTab === 'database' && (
+            <div className="space-y-5 animate-in fade-in duration-150">
+              {/* Storage Mode Selector Card */}
+              <div className="bg-[#141517] border border-[#2A2C2F] rounded-2xl p-4.5 space-y-4">
+                <div className="flex items-start justify-between">
+                  <div>
+                    <h3 className="font-bold text-white font-['Lato'] text-sm flex items-center gap-2">
+                      <HardDrive className="w-4 h-4 text-[#EE880E]" />
+                      Arquitectura de Persistencia Agnóstica
+                    </h3>
+                    <p className="text-[11px] text-slate-400 mt-0.5">
+                      Configura el almacenamiento centralizado de ProyectHandler. Si no configuras o deshabilitas la base de datos externa, todos los datos siguen guardándose localmente en el navegador (`localStorage`) con total transparencia y seguridad.
+                    </p>
+                  </div>
+
+                  {envDbInfo?.hasEnvDb && (
+                    <span className="inline-flex items-center gap-1.5 px-2.5 py-1 rounded-lg bg-[#61BFED]/15 text-[#61BFED] border border-[#61BFED]/30 text-[10px] font-bold">
+                      <Zap className="w-3 h-3" />
+                      .env detectado ({envDbInfo.envDbType.toUpperCase()})
+                    </span>
+                  )}
+                </div>
+
+                {/* Local vs External Toggle */}
+                <div className="grid grid-cols-1 sm:grid-cols-2 gap-3 pt-1">
+                  <div
+                    onClick={() => {
+                      setDbEnabled(false);
+                      setDbType('none');
+                    }}
+                    className={`p-3.5 rounded-xl border transition-all cursor-pointer flex flex-col justify-between ${
+                      !dbEnabled || dbType === 'none'
+                        ? 'bg-[#1C1E20] border-[#29E78C] shadow-sm shadow-[#29E78C]/15 ring-1 ring-[#29E78C]'
+                        : 'bg-[#18191B] border-[#2E3135] hover:border-slate-600 opacity-70 hover:opacity-100'
+                    }`}
+                  >
+                    <div className="flex items-center justify-between mb-2">
+                      <div className="flex items-center gap-2">
+                        <HardDrive className={`w-4 h-4 ${!dbEnabled || dbType === 'none' ? 'text-[#29E78C]' : 'text-slate-400'}`} />
+                        <span className="font-bold text-white text-xs">Almacenamiento Local (Por Defecto)</span>
+                      </div>
+                      {(!dbEnabled || dbType === 'none') && (
+                        <CheckCircle2 className="w-4 h-4 text-[#29E78C]" />
+                      )}
+                    </div>
+                    <p className="text-[11px] text-slate-400 leading-relaxed">
+                      Persistencia directa en <code className="text-slate-300">localStorage</code>. Sin dependencias externas, privacidad absoluta y disponibilidad inmediata sin configurar servidores.
+                    </p>
+                  </div>
+
+                  <div
+                    onClick={() => {
+                      setDbEnabled(true);
+                      if (dbType === 'none') setDbType('postgres');
+                    }}
+                    className={`p-3.5 rounded-xl border transition-all cursor-pointer flex flex-col justify-between ${
+                      dbEnabled && dbType !== 'none'
+                        ? 'bg-[#1C1E20] border-[#FF5038] shadow-sm shadow-[#FF5038]/15 ring-1 ring-[#FF5038]'
+                        : 'bg-[#18191B] border-[#2E3135] hover:border-slate-600 opacity-70 hover:opacity-100'
+                    }`}
+                  >
+                    <div className="flex items-center justify-between mb-2">
+                      <div className="flex items-center gap-2">
+                        <Database className={`w-4 h-4 ${dbEnabled && dbType !== 'none' ? 'text-[#FF5038]' : 'text-slate-400'}`} />
+                        <span className="font-bold text-white text-xs">Base de Datos Externa Agnóstica</span>
+                      </div>
+                      {dbEnabled && dbType !== 'none' && (
+                        <CheckCircle2 className="w-4 h-4 text-[#FF5038]" />
+                      )}
+                    </div>
+                    <p className="text-[11px] text-slate-400 leading-relaxed">
+                      Conecta con tu motor favorito (PostgreSQL, Snowflake, MySQL, SQLite, MongoDB o REST). Mantiene réplica en local para tolerancia a fallos.
+                    </p>
+                  </div>
+                </div>
+              </div>
+
+              {/* External Database Options (Visible when enabled) */}
+              {dbEnabled && dbType !== 'none' && (
+                <div className="bg-[#141517] border border-[#2A2C2F] rounded-2xl p-4.5 space-y-4 animate-in fade-in duration-200">
+                  <div className="flex items-center justify-between">
+                    <div>
+                      <h4 className="font-bold text-white text-xs flex items-center gap-2">
+                        <Database className="w-3.5 h-3.5 text-[#FF5038]" />
+                        Selecciona el Motor de Base de Datos
+                      </h4>
+                      <p className="text-[11px] text-slate-400 mt-0.5">
+                        Elige la tecnología de tu infraestructura. El modelo de datos es 100% interoperable.
+                      </p>
+                    </div>
+                  </div>
+
+                  {/* Engine Pills */}
+                  <div className="grid grid-cols-2 sm:grid-cols-3 gap-2.5">
+                    {[
+                      { id: 'postgres', name: 'PostgreSQL', sub: 'Supabase / Neon / RDS', icon: Database },
+                      { id: 'snowflake', name: 'Snowflake', sub: 'Cloud Data Warehouse', icon: Cloud },
+                      { id: 'mysql', name: 'MySQL / MariaDB', sub: 'Servidores relacionales', icon: Server },
+                      { id: 'sqlite', name: 'SQLite / Archivo', sub: 'Local persistente en server', icon: HardDrive },
+                      { id: 'mongodb', name: 'MongoDB', sub: 'Atlas / NoSQL Document Store', icon: Layers },
+                      { id: 'rest', name: 'API REST / Webhook', sub: 'Endpoint HTTP agnóstico', icon: ExternalLink },
+                    ].map((engine) => {
+                      const Icon = engine.icon;
+                      const isSelected = dbType === engine.id;
+                      return (
+                        <button
+                          key={engine.id}
+                          type="button"
+                          onClick={() => setDbType(engine.id as DatabaseType)}
+                          className={`p-3 rounded-xl border text-left transition-all cursor-pointer flex flex-col justify-between ${
+                            isSelected
+                              ? 'bg-gradient-to-tr from-[#1E2023] to-[#2B2321] border-[#FF5038] text-white shadow-xs'
+                              : 'bg-[#18191B] border-[#2E3135] text-slate-400 hover:text-white hover:bg-[#202225]'
+                          }`}
+                        >
+                          <div className="flex items-center justify-between mb-1">
+                            <Icon className={`w-4 h-4 ${isSelected ? 'text-[#FF5038]' : 'text-slate-400'}`} />
+                            {isSelected && <span className="w-2 h-2 rounded-full bg-[#FF5038]" />}
+                          </div>
+                          <span className="font-bold text-xs text-white">{engine.name}</span>
+                          <span className="text-[10px] text-slate-400 truncate">{engine.sub}</span>
+                        </button>
+                      );
+                    })}
+                  </div>
+
+                  {/* Connection Method Selector for supported engines */}
+                  {dbType !== 'sqlite' && (
+                    <div className="flex items-center justify-between pt-2 border-t border-[#2A2C2F]">
+                      <span className="text-[11px] font-semibold text-slate-300">Modo de Configuración:</span>
+                      <div className="flex items-center gap-1.5 bg-[#1B1D1F] p-1 rounded-xl border border-[#2E3135]">
+                        <button
+                          type="button"
+                          onClick={() => setUseConnectionString(true)}
+                          className={`px-3 py-1 rounded-lg text-xs font-medium transition-all cursor-pointer ${
+                            useConnectionString
+                              ? 'bg-[#FF5038] text-white'
+                              : 'text-slate-400 hover:text-white'
+                          }`}
+                        >
+                          Cadena de Conexión (URI)
+                        </button>
+                        <button
+                          type="button"
+                          onClick={() => setUseConnectionString(false)}
+                          className={`px-3 py-1 rounded-lg text-xs font-medium transition-all cursor-pointer ${
+                            !useConnectionString
+                              ? 'bg-[#FF5038] text-white'
+                              : 'text-slate-400 hover:text-white'
+                          }`}
+                        >
+                          Parámetros Detallados
+                        </button>
+                      </div>
+                    </div>
+                  )}
+
+                  {/* Form Inputs based on DB Type & Mode */}
+                  {useConnectionString && dbType !== 'sqlite' ? (
+                    <div className="space-y-2 pt-1">
+                      <label className="block text-[11px] font-bold text-slate-300">
+                        Cadena de Conexión (Connection String URI)
+                      </label>
+                      <input
+                        type="text"
+                        value={dbConnectionString}
+                        onChange={(e) => setDbConnectionString(e.target.value)}
+                        placeholder={
+                          dbType === 'snowflake'
+                            ? 'snowflake://usuario:password@org-cuenta.snowflakecomputing.com/?warehouse=COMPUTE_WH&db=PROJECTHANDLER_DB&schema=PUBLIC'
+                            : dbType === 'postgres'
+                            ? 'postgresql://usuario:password@host:5432/nombre_bd?sslmode=require'
+                            : dbType === 'mysql'
+                            ? 'mysql://usuario:password@host:3306/nombre_bd'
+                            : dbType === 'mongodb'
+                            ? 'mongodb+srv://usuario:password@cluster.mongodb.net/nombre_bd'
+                            : 'https://api.tuempresa.com/v1/projecthandler-storage'
+                        }
+                        className="w-full bg-[#18191B] border border-[#2E3135] focus:border-[#FF5038] rounded-xl px-3.5 py-2.5 text-xs text-white font-mono placeholder:text-slate-500 focus:outline-hidden"
+                      />
+                      <p className="text-[10px] text-slate-400">
+                        La URI incluye automáticamente usuario, contraseña, host, puerto y base de datos.
+                      </p>
+                    </div>
+                  ) : dbType === 'snowflake' ? (
+                    /* Snowflake Specific Parameters */
+                    <div className="grid grid-cols-1 sm:grid-cols-2 gap-3 pt-1">
+                      <div className="space-y-1.5 sm:col-span-2">
+                        <label className="block text-[11px] font-bold text-slate-300">
+                          Identificador de Cuenta de Snowflake (Account Identifier) *
+                        </label>
+                        <input
+                          type="text"
+                          value={dbSnowflakeAccount}
+                          onChange={(e) => setDbSnowflakeAccount(e.target.value)}
+                          placeholder="ej. HHFXICV-CIVICAPARTNER (formato org-cuenta)"
+                          className="w-full bg-[#18191B] border border-[#2E3135] focus:border-[#FF5038] rounded-xl px-3 py-2 text-xs text-white font-mono focus:outline-hidden"
+                        />
+                        <div className="text-[10px] text-slate-400 space-y-0.5">
+                          <p>
+                            Tu endpoint será:{' '}
+                            <code className="text-[#61BFED] font-mono">
+                              {dbSnowflakeAccount ? `${normalizeSnowflakeAccount(dbSnowflakeAccount)}.snowflakecomputing.com` : '<org-cuenta>.snowflakecomputing.com'}
+                            </code>
+                          </p>
+                          {dbSnowflakeAccount.includes('.') && (
+                            <p className="text-[#EE880E] text-[10px]">
+                              💡 Snowflake utiliza guion (-) entre organización y cuenta para validar certificados SSL (ej. HHFXICV-CIVICAPARTNER). Lo hemos normalizado automáticamente.
+                            </p>
+                          )}
+                        </div>
+                      </div>
+
+                      <div className="space-y-1.5">
+                        <label className="block text-[11px] font-bold text-slate-300">
+                          Almacén de Cómputo (Warehouse)
+                        </label>
+                        <input
+                          type="text"
+                          value={dbSnowflakeWarehouse}
+                          onChange={(e) => setDbSnowflakeWarehouse(e.target.value)}
+                          placeholder="COMPUTE_WH"
+                          className="w-full bg-[#18191B] border border-[#2E3135] focus:border-[#FF5038] rounded-xl px-3 py-2 text-xs text-white focus:outline-hidden"
+                        />
+                      </div>
+
+                      <div className="space-y-1.5">
+                        <label className="block text-[11px] font-bold text-slate-300">
+                          Base de Datos Snowflake (Database)
+                        </label>
+                        <input
+                          type="text"
+                          value={dbName}
+                          onChange={(e) => setDbName(e.target.value)}
+                          placeholder="PROJECTHANDLER_DB"
+                          className="w-full bg-[#18191B] border border-[#2E3135] focus:border-[#FF5038] rounded-xl px-3 py-2 text-xs text-white focus:outline-hidden"
+                        />
+                      </div>
+
+                      <div className="space-y-1.5">
+                        <label className="block text-[11px] font-bold text-slate-300">
+                          Esquema (Schema)
+                        </label>
+                        <input
+                          type="text"
+                          value={dbSnowflakeSchema}
+                          onChange={(e) => setDbSnowflakeSchema(e.target.value)}
+                          placeholder="PUBLIC"
+                          className="w-full bg-[#18191B] border border-[#2E3135] focus:border-[#FF5038] rounded-xl px-3 py-2 text-xs text-white focus:outline-hidden"
+                        />
+                      </div>
+
+                      <div className="space-y-1.5">
+                        <label className="block text-[11px] font-bold text-slate-300">
+                          Rol Snowflake (Role)
+                        </label>
+                        <input
+                          type="text"
+                          value={dbSnowflakeRole}
+                          onChange={(e) => setDbSnowflakeRole(e.target.value)}
+                          placeholder="ACCOUNTADMIN / SYSADMIN"
+                          className="w-full bg-[#18191B] border border-[#2E3135] focus:border-[#FF5038] rounded-xl px-3 py-2 text-xs text-white focus:outline-hidden"
+                        />
+                      </div>
+
+                      <div className="space-y-1.5 sm:col-span-2">
+                        <label className="block text-[11px] font-bold text-slate-300">
+                          Token Bearer / Personal Access Token / JWT (Snowflake SQL API)
+                        </label>
+                        <input
+                          type="password"
+                          value={dbAuthToken}
+                          onChange={(e) => setDbAuthToken(e.target.value)}
+                          placeholder="Token de autorización para Snowflake REST API v2"
+                          className="w-full bg-[#18191B] border border-[#2E3135] focus:border-[#FF5038] rounded-xl px-3 py-2 text-xs text-white font-mono focus:outline-hidden"
+                        />
+                      </div>
+                    </div>
+                  ) : dbType === 'rest' ? (
+                    /* REST API Parameters */
+                    <div className="space-y-3 pt-1">
+                      <div className="space-y-1.5">
+                        <label className="block text-[11px] font-bold text-slate-300">
+                          Endpoint Base de la API REST *
+                        </label>
+                        <input
+                          type="text"
+                          value={dbConnectionString}
+                          onChange={(e) => setDbConnectionString(e.target.value)}
+                          placeholder="https://api.tuempresa.com/v1/proyecthandler"
+                          className="w-full bg-[#18191B] border border-[#2E3135] focus:border-[#FF5038] rounded-xl px-3 py-2 text-xs text-white font-mono focus:outline-hidden"
+                        />
+                      </div>
+                      <div className="space-y-1.5">
+                        <label className="block text-[11px] font-bold text-slate-300">
+                          Token de Autorización Bearer (Opcional)
+                        </label>
+                        <input
+                          type="password"
+                          value={dbAuthToken}
+                          onChange={(e) => setDbAuthToken(e.target.value)}
+                          placeholder="Bearer eyJhbGciOiJIUzI1NiIs..."
+                          className="w-full bg-[#18191B] border border-[#2E3135] focus:border-[#FF5038] rounded-xl px-3 py-2 text-xs text-white font-mono focus:outline-hidden"
+                        />
+                      </div>
+                    </div>
+                  ) : dbType === 'sqlite' ? (
+                    /* SQLite Parameters */
+                    <div className="space-y-3 pt-1">
+                      <div className="space-y-1.5">
+                        <label className="block text-[11px] font-bold text-slate-300">
+                          Ruta del Archivo de Base de Datos Local
+                        </label>
+                        <input
+                          type="text"
+                          value={dbName}
+                          onChange={(e) => setDbName(e.target.value)}
+                          placeholder="./data/projecthandler_store.json"
+                          className="w-full bg-[#18191B] border border-[#2E3135] focus:border-[#FF5038] rounded-xl px-3 py-2 text-xs text-white font-mono focus:outline-hidden"
+                        />
+                        <p className="text-[10px] text-slate-400">
+                          Almacén estructurado persistente en el servidor Node.js sin requerir instalación de cliente SQL.
+                        </p>
+                      </div>
+                    </div>
+                  ) : (
+                    /* PostgreSQL / MySQL / MongoDB Discrete Parameters */
+                    <div className="grid grid-cols-1 sm:grid-cols-2 gap-3 pt-1">
+                      <div className="space-y-1.5 sm:col-span-2">
+                        <label className="block text-[11px] font-bold text-slate-300">
+                          Servidor / Host *
+                        </label>
+                        <input
+                          type="text"
+                          value={dbHost}
+                          onChange={(e) => setDbHost(e.target.value)}
+                          placeholder="localhost o db.ejemplo.supabase.co"
+                          className="w-full bg-[#18191B] border border-[#2E3135] focus:border-[#FF5038] rounded-xl px-3 py-2 text-xs text-white focus:outline-hidden"
+                        />
+                      </div>
+
+                      <div className="space-y-1.5">
+                        <label className="block text-[11px] font-bold text-slate-300">Puerto</label>
+                        <input
+                          type="number"
+                          value={dbPort}
+                          onChange={(e) => setDbPort(parseInt(e.target.value, 10) || 5432)}
+                          className="w-full bg-[#18191B] border border-[#2E3135] focus:border-[#FF5038] rounded-xl px-3 py-2 text-xs text-white font-mono focus:outline-hidden"
+                        />
+                      </div>
+
+                      <div className="space-y-1.5">
+                        <label className="block text-[11px] font-bold text-slate-300">
+                          Nombre de la Base de Datos *
+                        </label>
+                        <input
+                          type="text"
+                          value={dbName}
+                          onChange={(e) => setDbName(e.target.value)}
+                          placeholder="projecthandler"
+                          className="w-full bg-[#18191B] border border-[#2E3135] focus:border-[#FF5038] rounded-xl px-3 py-2 text-xs text-white focus:outline-hidden"
+                        />
+                      </div>
+
+                      <div className="space-y-1.5">
+                        <label className="block text-[11px] font-bold text-slate-300">Usuario</label>
+                        <input
+                          type="text"
+                          value={dbUsername}
+                          onChange={(e) => setDbUsername(e.target.value)}
+                          placeholder="postgres / admin"
+                          className="w-full bg-[#18191B] border border-[#2E3135] focus:border-[#FF5038] rounded-xl px-3 py-2 text-xs text-white focus:outline-hidden"
+                        />
+                      </div>
+
+                      <div className="space-y-1.5">
+                        <label className="block text-[11px] font-bold text-slate-300">Contraseña</label>
+                        <input
+                          type="password"
+                          value={dbPassword}
+                          onChange={(e) => setDbPassword(e.target.value)}
+                          placeholder="••••••••••••"
+                          className="w-full bg-[#18191B] border border-[#2E3135] focus:border-[#FF5038] rounded-xl px-3 py-2 text-xs text-white focus:outline-hidden"
+                        />
+                      </div>
+
+                      <div className="flex items-center gap-2 sm:col-span-2 pt-1">
+                        <input
+                          type="checkbox"
+                          id="db-ssl-checkbox"
+                          checked={dbSsl}
+                          onChange={(e) => setDbSsl(e.target.checked)}
+                          className="rounded border-[#2E3135] text-[#FF5038] focus:ring-0 cursor-pointer"
+                        />
+                        <label htmlFor="db-ssl-checkbox" className="text-xs text-slate-300 cursor-pointer">
+                          Habilitar conexión segura cifrada (SSL / TLS requerida en nubes como Supabase o Neon)
+                        </label>
+                      </div>
+                    </div>
+                  )}
+
+                  {/* Tabla / Colección y Opciones de Sincronización */}
+                  <div className="pt-3 border-t border-[#2A2C2F] grid grid-cols-1 sm:grid-cols-2 gap-3">
+                    <div className="space-y-1.5">
+                      <label className="block text-[11px] font-bold text-slate-300">
+                        Nombre de Tabla / Colección
+                      </label>
+                      <input
+                        type="text"
+                        value={dbTableName}
+                        onChange={(e) => setDbTableName(e.target.value)}
+                        placeholder="projecthandler_store"
+                        className="w-full bg-[#18191B] border border-[#2E3135] focus:border-[#FF5038] rounded-xl px-3 py-2 text-xs text-white font-mono focus:outline-hidden"
+                      />
+                    </div>
+
+                    <div className="flex items-center gap-2 pt-6">
+                      <input
+                        type="checkbox"
+                        id="db-autosync-checkbox"
+                        checked={dbAutoSync}
+                        onChange={(e) => setDbAutoSync(e.target.checked)}
+                        className="rounded border-[#2E3135] text-[#FF5038] focus:ring-0 cursor-pointer"
+                      />
+                      <label htmlFor="db-autosync-checkbox" className="text-xs text-slate-300 cursor-pointer">
+                        Sincronización continua automática con cada cambio
+                      </label>
+                    </div>
+                  </div>
+
+                  {/* Test Connection Button & Result */}
+                  <div className="pt-3 border-t border-[#2A2C2F] flex flex-wrap items-center justify-between gap-3">
+                    <button
+                      type="button"
+                      onClick={handleTestDatabase}
+                      disabled={isTestingDb}
+                      className="px-4 py-2 bg-[#25282B] hover:bg-[#2E3236] text-white border border-[#3E4247] rounded-xl text-xs font-semibold flex items-center gap-2 transition-colors disabled:opacity-50 cursor-pointer"
+                    >
+                      <RefreshCw className={`w-3.5 h-3.5 text-[#FF5038] ${isTestingDb ? 'animate-spin' : ''}`} />
+                      <span>{isTestingDb ? 'Verificando...' : `Probar Conexión con ${dbType.toUpperCase()}`}</span>
+                    </button>
+
+                    {dbTestResult && (
+                      <div
+                        className={`px-3 py-1.5 rounded-xl text-xs flex items-center gap-2 ${
+                          dbTestResult.success
+                            ? 'bg-[#29E78C]/10 text-[#29E78C] border border-[#29E78C]/30'
+                            : 'bg-[#FF5038]/10 text-[#FF5038] border border-[#FF5038]/30'
+                        }`}
+                      >
+                        {dbTestResult.success ? (
+                          <CheckCircle2 className="w-4 h-4 shrink-0" />
+                        ) : (
+                          <AlertTriangle className="w-4 h-4 shrink-0" />
+                        )}
+                        <span>
+                          {dbTestResult.message}
+                          {dbTestResult.latencyMs ? ` (${dbTestResult.latencyMs}ms)` : ''}
+                        </span>
+                      </div>
+                    )}
+                  </div>
+                </div>
+              )}
+
+              {/* Data Migration & Sync Operations Card */}
+              <div className="bg-[#141517] border border-[#2A2C2F] rounded-2xl p-4.5 space-y-3">
+                <div className="flex items-center justify-between">
+                  <div>
+                    <h4 className="font-bold text-white text-xs flex items-center gap-2">
+                      <UploadCloud className="w-4 h-4 text-[#EE880E]" />
+                      Migración y Sincronización de Datos
+                    </h4>
+                    <p className="text-[11px] text-slate-400 mt-0.5">
+                      Transfiere tus reuniones, temas históricos y configuraciones entre el almacenamiento local y la base de datos externa.
+                    </p>
+                  </div>
+                </div>
+
+                <div className="grid grid-cols-1 sm:grid-cols-2 gap-3 pt-2">
+                  <button
+                    type="button"
+                    onClick={handleMigrateToDatabase}
+                    disabled={isMigratingDb || (!dbEnabled && dbType === 'none')}
+                    className="p-3 bg-[#1C1E20] hover:bg-[#25282B] text-slate-200 border border-[#3E4247] rounded-xl text-xs font-semibold flex items-center gap-2.5 transition-all disabled:opacity-40 cursor-pointer"
+                  >
+                    <UploadCloud className={`w-4 h-4 text-[#EE880E] ${isMigratingDb ? 'animate-bounce' : ''}`} />
+                    <div className="text-left">
+                      <div className="text-white font-bold">Exportar datos a la Base de Datos</div>
+                      <div className="text-[10px] text-slate-400">Sube reuniones y temas locales a la base remota</div>
+                    </div>
+                  </button>
+
+                  <button
+                    type="button"
+                    onClick={handleImportFromDatabase}
+                    disabled={isImportingDb || (!dbEnabled && dbType === 'none')}
+                    className="p-3 bg-[#1C1E20] hover:bg-[#25282B] text-slate-200 border border-[#3E4247] rounded-xl text-xs font-semibold flex items-center gap-2.5 transition-all disabled:opacity-40 cursor-pointer"
+                  >
+                    <DownloadCloud className={`w-4 h-4 text-[#61BFED] ${isImportingDb ? 'animate-bounce' : ''}`} />
+                    <div className="text-left">
+                      <div className="text-white font-bold">Importar datos al Navegador</div>
+                      <div className="text-[10px] text-slate-400">Descarga los datos remotos al almacenamiento local</div>
+                    </div>
+                  </button>
+                </div>
+
+                {/* Status messages */}
+                {migrationStatus && (
+                  <div
+                    className={`mt-2 p-2.5 rounded-xl text-xs flex items-center gap-2 ${
+                      migrationStatus.success
+                        ? 'bg-[#29E78C]/10 text-[#29E78C] border border-[#29E78C]/30'
+                        : 'bg-[#FF5038]/10 text-[#FF5038] border border-[#FF5038]/30'
+                    }`}
+                  >
+                    {migrationStatus.success ? <CheckCircle2 className="w-4 h-4 shrink-0" /> : <AlertTriangle className="w-4 h-4 shrink-0" />}
+                    <span>{migrationStatus.message}</span>
+                  </div>
+                )}
+
+                {importStatus && (
+                  <div
+                    className={`mt-2 p-2.5 rounded-xl text-xs flex items-center gap-2 ${
+                      importStatus.success
+                        ? 'bg-[#29E78C]/10 text-[#29E78C] border border-[#29E78C]/30'
+                        : 'bg-[#FF5038]/10 text-[#FF5038] border border-[#FF5038]/30'
+                    }`}
+                  >
+                    {importStatus.success ? <CheckCircle2 className="w-4 h-4 shrink-0" /> : <AlertTriangle className="w-4 h-4 shrink-0" />}
+                    <span>{importStatus.message}</span>
+                  </div>
+                )}
               </div>
             </div>
           )}

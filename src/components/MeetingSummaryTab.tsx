@@ -38,7 +38,7 @@ import {
   MessageSquare,
   Unlink,
 } from 'lucide-react';
-import { MeetingAnalysis, ActionItem, JiraConfig, OrphanCommitment, Priority, JiraUser } from '../types';
+import { MeetingAnalysis, ActionItem, JiraConfig, OrphanCommitment, Priority, JiraUser, CloneTaskOptions } from '../types';
 import { DEFAULT_JIRA_USERS } from '../utils/storage';
 import { formatTeamsMessageSummary } from '../utils/exportUtils';
 import { DependencyFlowView } from './DependencyFlowView';
@@ -47,12 +47,15 @@ import { RACIMatrixView } from './RACIMatrixView';
 import { CompactTableView } from './CompactTableView';
 import { JiraConfirmModal } from './JiraConfirmModal';
 import { EmailShareModal } from './EmailShareModal';
+import { AutoResizeTextarea } from './AutoResizeTextarea';
 
 interface MeetingSummaryTabProps {
   meeting: MeetingAnalysis | null;
   jiraConfig: JiraConfig;
   jiraUsers?: JiraUser[];
-  onSyncSingleItem: (item: ActionItem) => Promise<void>;
+  availableTopics?: string[];
+  topicCategories?: string[];
+  onSyncSingleItem: (item: ActionItem, options?: CloneTaskOptions) => Promise<void>;
   onBatchSyncAll: () => Promise<void>;
   isBatchSyncing: boolean;
   onOpenTicketDetails: (item: ActionItem) => void;
@@ -75,6 +78,8 @@ export const MeetingSummaryTab: React.FC<MeetingSummaryTabProps> = ({
   meeting,
   jiraConfig,
   jiraUsers = DEFAULT_JIRA_USERS,
+  availableTopics = [],
+  topicCategories = [],
   onSyncSingleItem,
   onBatchSyncAll,
   isBatchSyncing,
@@ -141,12 +146,12 @@ export const MeetingSummaryTab: React.FC<MeetingSummaryTabProps> = ({
     setItemToConfirm(item);
   };
 
-  const handleConfirmedSync = async (updatedItem?: ActionItem) => {
+  const handleConfirmedSync = async (updatedItem?: ActionItem, options?: CloneTaskOptions) => {
     const targetItem = updatedItem || itemToConfirm;
     if (!targetItem) return;
     setSyncingItemId(targetItem.id);
     try {
-      await onSyncSingleItem(targetItem);
+      await onSyncSingleItem(targetItem, options);
     } finally {
       setSyncingItemId(null);
     }
@@ -194,6 +199,28 @@ export const MeetingSummaryTab: React.FC<MeetingSummaryTabProps> = ({
     } finally {
       setSendingCommentItemId(null);
     }
+  };
+
+  const handleSyncCriteriaToItemComment = (item: ActionItem) => {
+    const criteria = (item.acceptanceCriteria || []).map((c) => String(c).trim()).filter(Boolean);
+    const count = criteria.length;
+    const current = (editingComments[item.id] !== undefined ? editingComments[item.id] : (item.proposedComment || '')).trim();
+
+    const criteriaRegex = /\n*Criterios de Aceptaci[oó]n.*$/is;
+    let baseComment = current.replace(criteriaRegex, '').trim();
+    if (!baseComment) {
+      const today = new Date().toISOString().split('T')[0];
+      baseComment = `Avance ${today}: Se revisaron los compromisos y avances sobre esta tarea.`;
+    }
+
+    const criteriaBlock = count > 0
+      ? `\n\nCriterios de Aceptación (${count}):\n${criteria.join('\n')}`
+      : '';
+
+    setEditingComments({
+      ...editingComments,
+      [item.id]: `${baseComment}${criteriaBlock}`,
+    });
   };
 
   const totalPoints = meeting.actionItems.reduce((acc, curr) => acc + (curr.storyPoints || 0), 0);
@@ -836,11 +863,29 @@ export const MeetingSummaryTab: React.FC<MeetingSummaryTabProps> = ({
                           )}
                         </div>
                       ) : (
-                        <div className="mb-2.5 flex items-center justify-between gap-2">
-                          <span className="text-[10px] bg-emerald-500/15 text-emerald-400 border border-emerald-500/30 px-2 py-0.5 rounded-md font-bold flex items-center gap-1">
-                            <Sparkles className="w-3 h-3" />
-                            Tarea Nueva para Jira
-                          </span>
+                        <div className="mb-2.5 flex flex-wrap items-center justify-between gap-2">
+                          <div className="flex flex-wrap items-center gap-1.5">
+                            <span className="text-[10px] bg-emerald-500/15 text-emerald-400 border border-emerald-500/30 px-2 py-0.5 rounded-md font-bold flex items-center gap-1">
+                              <Sparkles className="w-3 h-3" />
+                              Tarea Nueva para Jira
+                            </span>
+                            {item.derivedFromKey && (
+                              <span
+                                title={`Tarea derivada a partir de ${item.derivedFromKey}`}
+                                className="text-[10px] bg-[#EE880E]/15 text-[#EE880E] border border-[#EE880E]/30 px-2 py-0.5 rounded-md font-mono font-semibold"
+                              >
+                                ↳ Derivada de {item.derivedFromKey}
+                              </span>
+                            )}
+                            {item.epicKey && (
+                              <span
+                                title={item.epicSummary ? `Épica: ${item.epicSummary}` : `Épica Padre: ${item.epicKey}`}
+                                className="text-[10px] bg-[#9B51E0]/15 text-[#9B51E0] border border-[#9B51E0]/30 px-2 py-0.5 rounded-md font-mono font-semibold"
+                              >
+                                Épica: {item.epicKey}
+                              </span>
+                            )}
+                          </div>
                         </div>
                       )}
 
@@ -900,22 +945,35 @@ export const MeetingSummaryTab: React.FC<MeetingSummaryTabProps> = ({
                               <MessageSquare className="w-3.5 h-3.5 text-[#EE880E]" />
                               Comentario sugerido para Jira
                             </span>
-                            {item.commentStatus === 'added' ? (
-                              <span className="text-[10px] text-[#29E78C] font-semibold flex items-center gap-1 bg-emerald-950/40 px-2 py-0.5 rounded border border-[#29E78C]/30">
-                                <Check className="w-3 h-3" /> Publicado
-                              </span>
-                            ) : (
-                              <span className="text-[10px] text-slate-400 font-mono">
-                                {item.matchedJiraKey}
-                              </span>
-                            )}
+                            <div className="flex items-center gap-2">
+                              {item.acceptanceCriteria && item.acceptanceCriteria.length > 0 && (
+                                <button
+                                  type="button"
+                                  onClick={() => handleSyncCriteriaToItemComment(item)}
+                                  className="text-[10px] text-[#EE880E] hover:text-[#FFA034] hover:underline flex items-center gap-1 font-semibold cursor-pointer transition-colors"
+                                  title="Inserta o actualiza los criterios de aceptación en el comentario sugerido"
+                                >
+                                  <Sparkles className="w-3 h-3 text-[#EE880E]" />
+                                  <span>Sincronizar Criterios</span>
+                                </button>
+                              )}
+                              {item.commentStatus === 'added' ? (
+                                <span className="text-[10px] text-[#29E78C] font-semibold flex items-center gap-1 bg-emerald-950/40 px-2 py-0.5 rounded border border-[#29E78C]/30">
+                                  <Check className="w-3 h-3" /> Publicado
+                                </span>
+                              ) : (
+                                <span className="text-[10px] text-slate-400 font-mono">
+                                  {item.matchedJiraKey}
+                                </span>
+                              )}
+                            </div>
                           </div>
-                          <textarea
-                            rows={2}
+                          <AutoResizeTextarea
+                            minRows={3}
                             value={editingComments[item.id] !== undefined ? editingComments[item.id] : item.proposedComment}
                             onChange={(e) => setEditingComments({ ...editingComments, [item.id]: e.target.value })}
                             placeholder="Comentario para registrar avances en Jira..."
-                            className="w-full bg-[#1C1E20] border border-[#2E3135] rounded-lg p-2 text-xs text-slate-200 focus:outline-none focus:border-[#FF5038]"
+                            className="w-full bg-[#1C1E20] border border-[#2E3135] rounded-lg p-2.5 text-xs text-slate-200 focus:outline-none focus:border-[#FF5038] font-mono leading-relaxed"
                           />
                           <div className="flex justify-end gap-2">
                             <button
@@ -1050,6 +1108,8 @@ export const MeetingSummaryTab: React.FC<MeetingSummaryTabProps> = ({
         item={itemToConfirm}
         jiraConfig={jiraConfig}
         jiraUsers={jiraUsers}
+        availableTopics={availableTopics}
+        topicCategories={topicCategories}
       />
 
       {/* Email Share Modal (Clean, professional, without emojis, with subject) */}

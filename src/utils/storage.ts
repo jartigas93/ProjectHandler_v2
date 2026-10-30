@@ -7,7 +7,9 @@ import {
   JiraUser,
   AIProviderConfig,
   AIModelOption,
-  SavedCustomPrompt
+  SavedCustomPrompt,
+  DatabaseConfig,
+  DatabaseType
 } from '../types';
 
 const STORAGE_KEYS = {
@@ -237,6 +239,25 @@ Directivas para el resumen y tickets de Jira:
   },
 ];
 
+export const DEFAULT_DATABASE_CONFIG: DatabaseConfig = {
+  enabled: false,
+  type: 'none',
+  connectionString: '',
+  host: 'localhost',
+  port: 5432,
+  database: 'projecthandler',
+  username: '',
+  password: '',
+  ssl: false,
+  authToken: '',
+  snowflakeAccount: '',
+  snowflakeWarehouse: 'COMPUTE_WH',
+  snowflakeSchema: 'PUBLIC',
+  snowflakeRole: 'SYSADMIN',
+  tableName: 'projecthandler_store',
+  autoSync: true,
+};
+
 export const DEFAULT_PROJECT_SETTINGS: ProjectSettings = {
   storyPointsScale: [1, 2, 3, 5, 8, 13, 21],
   defaultStoryPoints: 3,
@@ -246,6 +267,7 @@ export const DEFAULT_PROJECT_SETTINGS: ProjectSettings = {
   jiraUsers: DEFAULT_JIRA_USERS,
   jira: DEFAULT_JIRA_CONFIG,
   ai: DEFAULT_AI_CONFIG,
+  database: DEFAULT_DATABASE_CONFIG,
   savedCustomPrompts: DEFAULT_SAVED_PROMPTS,
 };
 
@@ -389,6 +411,7 @@ export function loadProjectSettings(): ProjectSettings {
         jiraUsers: parsed.jiraUsers?.length > 0 ? parsed.jiraUsers : DEFAULT_JIRA_USERS,
         topicCategories: parsed.topicCategories?.length > 0 ? parsed.topicCategories : DEFAULT_TOPIC_CATEGORIES,
         ai: { ...DEFAULT_AI_CONFIG, ...(parsed.ai || {}) },
+        database: { ...DEFAULT_DATABASE_CONFIG, ...(parsed.database || {}) },
         savedCustomPrompts: Array.isArray(parsed.savedCustomPrompts) && parsed.savedCustomPrompts.length > 0
           ? parsed.savedCustomPrompts.slice(0, 3)
           : loadSavedCustomPrompts(),
@@ -414,6 +437,10 @@ export function saveProjectSettings(settings: ProjectSettings): void {
     // Also sync legacy Jira config key for backwards compatibility
     if (settings.jira) {
       localStorage.setItem(STORAGE_KEYS.JIRA_CONFIG, JSON.stringify(settings.jira));
+    }
+    // Background sync to database if enabled
+    if (settings.database?.enabled && settings.database.type !== 'none') {
+      syncItemToDatabase('settings', 'main', settings).catch(() => {});
     }
   } catch (e) {
     console.error('Error saving project settings:', e);
@@ -575,5 +602,203 @@ export async function fetchFactoryAiModels(): Promise<{ factoryModels: AIModelOp
     };
   }
 }
+
+// ============================================================================
+// Agnostic Database Sync Helpers
+// ============================================================================
+
+export function getActiveDatabaseConfig(): DatabaseConfig | null {
+  try {
+    const raw = localStorage.getItem(STORAGE_KEYS.PROJECT_SETTINGS);
+    if (!raw) return null;
+    const settings = JSON.parse(raw);
+    if (settings.database?.enabled && settings.database.type !== 'none') {
+      return settings.database;
+    }
+  } catch {}
+  return null;
+}
+
+export async function syncItemToDatabase(collection: string, key: string, data: any): Promise<boolean> {
+  const dbConfig = getActiveDatabaseConfig();
+  if (!dbConfig) return true; // Stored locally, no remote db to sync
+  try {
+    const res = await fetch('/api/db/save', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ config: dbConfig, collection, key, data }),
+    });
+    return res.ok;
+  } catch (err) {
+    console.warn(`[Storage] Failed to sync ${collection}/${key} to remote database:`, err);
+    return false;
+  }
+}
+
+export async function deleteItemFromDatabase(collection: string, key: string): Promise<boolean> {
+  const dbConfig = getActiveDatabaseConfig();
+  if (!dbConfig) return true;
+  try {
+    const res = await fetch('/api/db/delete', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ config: dbConfig, collection, key }),
+    });
+    return res.ok;
+  } catch (err) {
+    console.warn(`[Storage] Failed to delete ${collection}/${key} from remote database:`, err);
+    return false;
+  }
+}
+
+export async function testDatabaseConnection(config: DatabaseConfig): Promise<{
+  success: boolean;
+  latencyMs: number;
+  engine: string;
+  message: string;
+  details?: Record<string, any>;
+  error?: string;
+}> {
+  try {
+    const res = await fetch('/api/db/test-connection', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify(config),
+    });
+    return await res.json();
+  } catch (err: any) {
+    return {
+      success: false,
+      latencyMs: 0,
+      engine: config.type,
+      message: 'Error de red contactando al servidor local para probar la base de datos.',
+      error: err.message,
+    };
+  }
+}
+
+export async function fetchEnvDatabaseConfig(): Promise<{
+  hasEnvDb: boolean;
+  envDbType: string;
+  hasConnectionString: boolean;
+  snowflakeAccount?: string;
+}> {
+  try {
+    const res = await fetch('/api/db/env-config');
+    if (!res.ok) throw new Error('Failed to fetch env db config');
+    return await res.json();
+  } catch {
+    return {
+      hasEnvDb: false,
+      envDbType: 'none',
+      hasConnectionString: false,
+    };
+  }
+}
+
+export async function bulkMigrateLocalToDatabase(config?: DatabaseConfig): Promise<{
+  success: boolean;
+  migrated?: Record<string, number>;
+  error?: string;
+}> {
+  const targetConfig = config || getActiveDatabaseConfig();
+  if (!targetConfig) {
+    return { success: false, error: 'No hay configuración de base de datos activa.' };
+  }
+
+  const payload = {
+    settings: loadProjectSettings(),
+    meetings: loadSavedMeetings(),
+    topics: loadTopicHistory(),
+    reports: loadMonthlyReports(),
+    customModels: loadCustomAiModels(),
+  };
+
+  try {
+    const res = await fetch('/api/db/migrate', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ config: targetConfig, payload }),
+    });
+    return await res.json();
+  } catch (err: any) {
+    return { success: false, error: err.message || 'Error en la migración a la base de datos.' };
+  }
+}
+
+export async function importFromDatabaseToLocal(config?: DatabaseConfig): Promise<{
+  success: boolean;
+  importedCounts: { meetings: number; topics: number; reports: number };
+  error?: string;
+}> {
+  const targetConfig = config || getActiveDatabaseConfig();
+  if (!targetConfig) {
+    return {
+      success: false,
+      importedCounts: { meetings: 0, topics: 0, reports: 0 },
+      error: 'No hay configuración de base de datos activa.',
+    };
+  }
+
+  try {
+    const [meetingsRes, topicsRes, reportsRes] = await Promise.all([
+      fetch('/api/db/data', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ config: targetConfig, collection: 'meetings' }),
+      }),
+      fetch('/api/db/data', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ config: targetConfig, collection: 'topics' }),
+      }),
+      fetch('/api/db/data', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ config: targetConfig, collection: 'monthly_reports' }),
+      }),
+    ]);
+
+    let meetingsCount = 0;
+    let topicsCount = 0;
+    let reportsCount = 0;
+
+    if (meetingsRes.ok) {
+      const data = await meetingsRes.json();
+      if (Array.isArray(data.data) && data.data.length > 0) {
+        localStorage.setItem(STORAGE_KEYS.MEETINGS, JSON.stringify(data.data));
+        meetingsCount = data.data.length;
+      }
+    }
+
+    if (topicsRes.ok) {
+      const data = await topicsRes.json();
+      if (Array.isArray(data.data) && data.data.length > 0) {
+        localStorage.setItem(STORAGE_KEYS.TOPICS, JSON.stringify(data.data));
+        topicsCount = data.data.length;
+      }
+    }
+
+    if (reportsRes.ok) {
+      const data = await reportsRes.json();
+      if (Array.isArray(data.data) && data.data.length > 0) {
+        localStorage.setItem(STORAGE_KEYS.MONTHLY_REPORTS, JSON.stringify(data.data));
+        reportsCount = data.data.length;
+      }
+    }
+
+    return {
+      success: true,
+      importedCounts: { meetings: meetingsCount, topics: topicsCount, reports: reportsCount },
+    };
+  } catch (err: any) {
+    return {
+      success: false,
+      importedCounts: { meetings: 0, topics: 0, reports: 0 },
+      error: err.message,
+    };
+  }
+}
+
 
 

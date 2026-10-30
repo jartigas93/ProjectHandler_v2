@@ -16,7 +16,9 @@ import {
   JiraConfig,
   ProjectSettings,
   PromptMode,
-  TopicStatus
+  TopicStatus,
+  CloneTaskOptions,
+  TaskDependency
 } from './types';
 import {
   loadSavedMeetings,
@@ -104,7 +106,17 @@ export default function App() {
     if (loadedReports.length > 0) {
       setCurrentMonthlyReport(loadedReports[0]);
     }
-    // Clean initial state: no sample/test meetings loaded by default
+
+    const handleStorageUpdated = () => {
+      setTopicsHistory(loadTopicHistory());
+      setSavedMeetingsList(loadSavedMeetings());
+      setMonthlyReports(loadMonthlyReports());
+      setProjectSettings(loadProjectSettings());
+    };
+    window.addEventListener('teams2jira_local_storage_updated', handleStorageUpdated);
+    return () => {
+      window.removeEventListener('teams2jira_local_storage_updated', handleStorageUpdated);
+    };
   }, []);
 
   // Handler: Analyze Transcript with Server-Side Gemini API
@@ -364,6 +376,101 @@ export default function App() {
     setSavedToHistory(true);
   };
 
+  // Helper: Ensure a topic (modified or newly created from a task modal) is registered in both the meeting and TopicHistory
+  const ensureTopicRegistered = (
+    topicName: string,
+    category?: string,
+    issueKey?: string,
+    leadAssignee?: string,
+    meetingRef?: MeetingAnalysis | null
+  ): MeetingAnalysis | null => {
+    const cleanTopic = (topicName || '').trim();
+    if (!cleanTopic) return meetingRef || null;
+
+    const currentTopics = loadTopicHistory();
+    const normTarget = normalizeTopicText(cleanTopic);
+    const tIndex = currentTopics.findIndex((t) => normalizeTopicText(t.topicName) === normTarget);
+
+    const targetMeeting = meetingRef || activeMeeting;
+    const meetingDateStr = targetMeeting?.meetingDate || new Date().toISOString().split('T')[0];
+    const meetingIdStr = targetMeeting?.id || 'meeting-' + Date.now();
+    const meetingTitleStr = targetMeeting?.meetingTitle || 'Sesión de Seguimiento';
+
+    if (tIndex >= 0) {
+      let changed = false;
+      const existing = { ...currentTopics[tIndex] };
+      if (issueKey && !existing.associatedJiraKeys.includes(issueKey)) {
+        existing.associatedJiraKeys = [...existing.associatedJiraKeys, issueKey];
+        changed = true;
+      }
+      if (category && existing.category === 'General' && category !== 'General') {
+        existing.category = category;
+        changed = true;
+      }
+      if (changed) {
+        existing.updatedAt = new Date().toISOString();
+        currentTopics[tIndex] = existing;
+        saveTopicHistory(currentTopics);
+        setTopicsHistory(currentTopics);
+      }
+    } else {
+      const dateFormatted = new Date(meetingDateStr).toLocaleDateString('es-ES', { timeZone: 'UTC' });
+      const newTopicRecord: TopicHistoryRecord = {
+        id: 'topic-' + Date.now() + '-' + Math.random().toString(36).substring(2, 6),
+        topicName: cleanTopic,
+        category: category || 'General',
+        firstDiscussedDate: meetingDateStr,
+        lastDiscussedDate: meetingDateStr,
+        meetings: [
+          {
+            meetingId: meetingIdStr,
+            meetingTitle: meetingTitleStr,
+            date: meetingDateStr,
+            summary: `Tema creado/asignado desde gestión de tareas (${issueKey || 'Nuevo compromiso'}).`,
+          },
+        ],
+        status: 'En Progreso',
+        leadParticipant: leadAssignee || targetMeeting?.participants?.[0]?.name || 'Equipo',
+        allParticipants: targetMeeting ? targetMeeting.participants.map((p) => p.name) : leadAssignee ? [leadAssignee] : [],
+        associatedJiraKeys: issueKey ? [issueKey] : [],
+        progressPercent: 30,
+        notes: [
+          `${dateFormatted} [${meetingTitleStr}]: Tema creado y vinculado a partir de desglose de tareas${issueKey ? ` (${issueKey})` : ''}.`,
+        ],
+        updatedAt: new Date().toISOString(),
+      };
+      const updatedTopics = [newTopicRecord, ...currentTopics];
+      saveTopicHistory(updatedTopics);
+      setTopicsHistory(updatedTopics);
+    }
+
+    if (targetMeeting) {
+      const existsInMeeting = (targetMeeting.mainTopics || []).some(
+        (mt) => normalizeTopicText(mt.topicName) === normTarget
+      );
+      if (!existsInMeeting) {
+        return {
+          ...targetMeeting,
+          mainTopics: [
+            ...(targetMeeting.mainTopics || []),
+            {
+              id: 'top-' + Date.now(),
+              topicName: cleanTopic,
+              category: category || 'General',
+              discussionSummary: `Tema registrado durante el desglose de tareas de la sesión.`,
+              status: 'En Progreso',
+              riskLevel: 'Bajo',
+              leadAssignee: leadAssignee || targetMeeting.participants?.[0]?.name || 'Equipo',
+              matchedJiraKey: issueKey,
+            },
+          ],
+        };
+      }
+    }
+
+    return targetMeeting || null;
+  };
+
   // Handler: Manual save to topic history
   const handleSaveToTopicHistory = () => {
     if (!activeMeeting) return;
@@ -372,7 +479,7 @@ export default function App() {
   };
 
   // Handler: Sync Single Action Item to Jira
-  const handleSyncSingleItem = async (item: ActionItem) => {
+  const handleSyncSingleItem = async (item: ActionItem, options?: CloneTaskOptions) => {
     if (!activeMeeting) return;
 
     try {
@@ -396,6 +503,7 @@ export default function App() {
         if (act.id === item.id) {
           return {
             ...act,
+            ...item,
             jiraTicketKey: data.issueKey,
             jiraTicketUrl: data.issueUrl,
             jiraStatus: 'synced' as const,
@@ -405,22 +513,13 @@ export default function App() {
         return act;
       });
 
-      const updatedMeeting = { ...activeMeeting, actionItems: updatedActionItems };
+      let updatedMeeting: MeetingAnalysis = { ...activeMeeting, actionItems: updatedActionItems };
+      updatedMeeting =
+        ensureTopicRegistered(item.topicName, options?.newTopicCategory, data.issueKey, item.assignee, updatedMeeting) ||
+        updatedMeeting;
+
       setActiveMeeting(updatedMeeting);
       saveMeeting(updatedMeeting);
-
-      // Also record ticket key in topics history if topic matches
-      if (item.topicName) {
-        const currentTopics = loadTopicHistory();
-        const tIndex = currentTopics.findIndex(
-          (t) => t.topicName.toLowerCase().trim() === item.topicName.toLowerCase().trim()
-        );
-        if (tIndex >= 0 && !currentTopics[tIndex].associatedJiraKeys.includes(data.issueKey)) {
-          currentTopics[tIndex].associatedJiraKeys.push(data.issueKey);
-          saveTopicHistory(currentTopics);
-          setTopicsHistory(currentTopics);
-        }
-      }
 
       showToast(
         'success',
@@ -429,6 +528,232 @@ export default function App() {
     } catch (err: any) {
       console.error('Error syncing to Jira:', err);
       showToast('error', err.message || 'Error al conectar con Jira.');
+    }
+  };
+
+  // Handler: Update Existing Action Item directly in Jira Cloud
+  const handleUpdateItemInJira = async (item: ActionItem) => {
+    if (!activeMeeting) return;
+    const targetKey = item.jiraTicketKey || item.matchedJiraKey;
+    if (!targetKey) {
+      showToast('error', 'El ticket no tiene una clave de Jira vinculada para actualizar.');
+      return;
+    }
+
+    try {
+      const res = await fetch('/api/jira/update-issue', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          issueKey: targetKey,
+          actionItem: item,
+          jiraConfig,
+          jiraUsers: projectSettings.jiraUsers,
+        }),
+      });
+
+      const data = await res.json();
+      if (!res.ok || !data.success) {
+        throw new Error(data.error || 'Error al actualizar el ticket en Jira.');
+      }
+
+      const updatedActionItems = activeMeeting.actionItems.map((act) => {
+        if (act.id === item.id) {
+          return {
+            ...act,
+            ...item,
+            jiraTicketKey: targetKey,
+            jiraTicketUrl: data.issueUrl || act.jiraTicketUrl,
+            jiraStatus: 'synced' as const,
+            jiraSyncedAt: data.updatedAt,
+          };
+        }
+        return act;
+      });
+
+      let updatedMeeting: MeetingAnalysis = { ...activeMeeting, actionItems: updatedActionItems };
+      updatedMeeting =
+        ensureTopicRegistered(item.topicName, undefined, targetKey, item.assignee, updatedMeeting) ||
+        updatedMeeting;
+
+      setActiveMeeting(updatedMeeting);
+      saveMeeting(updatedMeeting);
+
+      showToast(
+        'success',
+        `Ticket ${targetKey} actualizado exitosamente en Jira (${jiraConfig.simulationMode ? 'Modo Simulado' : 'Jira Cloud'}).`
+      );
+    } catch (err: any) {
+      console.error('Error updating Jira issue:', err);
+      showToast('error', err.message || 'Error al actualizar en Jira.');
+    }
+  };
+
+  // Handler: Create a Brand New Jira Issue from an existing topic/card content (Option A: adds new card to meeting)
+  const handleCreateFromExisting = async (item: ActionItem, options?: CloneTaskOptions) => {
+    if (!activeMeeting) return;
+
+    try {
+      const linkPayload =
+        options?.sourceTicketKey && options?.linkType && options.linkType !== 'none'
+          ? { sourceKey: options.sourceTicketKey, linkType: options.linkType }
+          : undefined;
+
+      const res = await fetch('/api/jira/create-issue', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          actionItem: {
+            ...item,
+            taskKind: 'new',
+            matchedJiraKey: undefined,
+          },
+          jiraConfig,
+          jiraUsers: projectSettings.jiraUsers,
+          linkToIssue: linkPayload,
+        }),
+      });
+
+      const data = await res.json();
+      if (!res.ok || !data.success) {
+        throw new Error(data.error || 'Error al crear la nueva tarea en Jira.');
+      }
+
+      // Create new ActionItem and append to active meeting
+      const newItem: ActionItem = {
+        ...item,
+        id: 'act-' + Date.now(),
+        taskKind: 'new',
+        matchedJiraKey: undefined,
+        matchConfidence: undefined,
+        matchReason: undefined,
+        proposedComment: undefined,
+        commentStatus: undefined,
+        commentAddedAt: undefined,
+        lastCommentId: undefined,
+        jiraTicketKey: data.issueKey,
+        jiraTicketUrl: data.issueUrl,
+        jiraStatus: 'synced',
+        jiraSyncedAt: data.syncedAt,
+        derivedFromKey: options?.sourceTicketKey,
+        jiraLinkType: options?.linkType && options.linkType !== 'none' ? options.linkType : undefined,
+      };
+
+      // Handle Split Acceptance Criteria on the source ActionItem if requested
+      let updatedExistingItems = [...activeMeeting.actionItems];
+      let originalItemToUpdateInJira: ActionItem | null = null;
+
+      if (
+        options?.splitCriteria &&
+        options.splitCriteria.movedCriteria.length > 0 &&
+        options.sourceItemId
+      ) {
+        const remaining = options.splitCriteria.remainingCriteria;
+        updatedExistingItems = updatedExistingItems.map((act) => {
+          if (act.id === options.sourceItemId) {
+            // Also refresh the criteria block in proposedComment if present
+            let nextComment = act.proposedComment;
+            if (nextComment) {
+              const criteriaRegex = /\n*Criterios de Aceptaci[oó]n.*$/is;
+              const baseComment = nextComment.replace(criteriaRegex, '').trim();
+              const criteriaBlock =
+                remaining.length > 0
+                  ? `\n\nCriterios de Aceptación (${remaining.length}):\n${remaining.join('\n')}`
+                  : '';
+              nextComment = `${baseComment}${criteriaBlock}`;
+            }
+            const updatedOrig: ActionItem = {
+              ...act,
+              acceptanceCriteria: remaining,
+              proposedComment: nextComment,
+            };
+            originalItemToUpdateInJira = updatedOrig;
+            return updatedOrig;
+          }
+          return act;
+        });
+      }
+
+      // Build automatic TaskDependency if linkType is blocking ('is_blocked_by' or 'blocks')
+      const currentDependencies = [...(activeMeeting.dependencies || [])];
+      if (
+        options?.sourceItemId &&
+        (options.linkType === 'is_blocked_by' || options.linkType === 'blocks')
+      ) {
+        const sourceItem = updatedExistingItems.find((a) => a.id === options.sourceItemId);
+        if (sourceItem) {
+          const isNewBlockedBySource = options.linkType === 'is_blocked_by';
+          const blocker = isNewBlockedBySource ? sourceItem : newItem;
+          const blocked = isNewBlockedBySource ? newItem : sourceItem;
+
+          const newDep: TaskDependency = {
+            id: 'dep-' + Date.now(),
+            blockerTaskId: blocker.id,
+            blockerTitle: blocker.title,
+            blockerAssignee: blocker.assignee,
+            blockedTaskId: blocked.id,
+            blockedTitle: blocked.title,
+            blockedAssignee: blocked.assignee,
+            description: `Dependencia creada al derivar ${data.issueKey} desde ${options.sourceTicketKey || sourceItem.title}`,
+          };
+          currentDependencies.push(newDep);
+        }
+      }
+
+      let updatedMeeting: MeetingAnalysis = {
+        ...activeMeeting,
+        actionItems: [...updatedExistingItems, newItem],
+        dependencies: currentDependencies,
+      };
+
+      updatedMeeting =
+        ensureTopicRegistered(
+          newItem.topicName,
+          options?.newTopicCategory,
+          data.issueKey,
+          newItem.assignee,
+          updatedMeeting
+        ) || updatedMeeting;
+
+      setActiveMeeting(updatedMeeting);
+      saveMeeting(updatedMeeting);
+
+      // If the user checked "Actualizar también el ticket original en Jira Cloud quitando los criterios movidos"
+      if (
+        options?.splitCriteria?.updateOriginalInJira &&
+        originalItemToUpdateInJira
+      ) {
+        const origTarget: ActionItem = originalItemToUpdateInJira;
+        const origKey = origTarget.jiraTicketKey || origTarget.matchedJiraKey;
+        if (origKey) {
+          await fetch('/api/jira/update-issue', {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({
+              issueKey: origKey,
+              actionItem: origTarget,
+              jiraConfig,
+              jiraUsers: projectSettings.jiraUsers,
+            }),
+          }).catch((e) => console.warn('Failed to update original ticket criteria in Jira:', e));
+        }
+      }
+
+      const linkNotice = data.linkResult?.linked
+        ? ` | Vinculada a ${options?.sourceTicketKey}`
+        : '';
+      const splitNotice =
+        options?.splitCriteria && options.splitCriteria.movedCriteria.length > 0
+          ? ` | ${options.splitCriteria.movedCriteria.length} criterio(s) movidos`
+          : '';
+
+      showToast(
+        'success',
+        `Nueva tarea ${data.issueKey} creada en Jira (${newItem.topicName}${linkNotice}${splitNotice}).`
+      );
+    } catch (err: any) {
+      console.error('Error creating from existing:', err);
+      showToast('error', err.message || 'Error al crear nueva tarea en Jira.');
     }
   };
 
@@ -460,10 +785,27 @@ export default function App() {
   const handleUpdateItem = (updated: ActionItem) => {
     if (!activeMeeting) return;
     const items = activeMeeting.actionItems.map((i) => (i.id === updated.id ? updated : i));
-    const meeting = { ...activeMeeting, actionItems: items };
+    let meeting: MeetingAnalysis = { ...activeMeeting, actionItems: items };
+    meeting =
+      ensureTopicRegistered(
+        updated.topicName,
+        undefined,
+        updated.jiraTicketKey || updated.matchedJiraKey,
+        updated.assignee,
+        meeting
+      ) || meeting;
     setActiveMeeting(meeting);
     saveMeeting(meeting);
   };
+
+  // Deduplicated list of available topics across active meeting and topic history
+  const availableTopics = Array.from(
+    new Set([
+      ...(activeMeeting?.mainTopics || []).map((t) => t.topicName),
+      ...(activeMeeting?.actionItems || []).map((a) => a.topicName),
+      ...topicsHistory.map((t) => t.topicName),
+    ].map((s) => (s || '').trim()).filter(Boolean))
+  );
 
   // Latest active meeting, readable from async callbacks without stale closures
   const activeMeetingRef = useRef<MeetingAnalysis | null>(null);
@@ -678,6 +1020,7 @@ export default function App() {
           issueKey: targetKey,
           comment: commentToSend,
           jiraConfig,
+          commentId: item.lastCommentId,
         }),
       });
 
@@ -693,6 +1036,7 @@ export default function App() {
             ...act,
             commentStatus: 'added' as const,
             commentAddedAt: data.addedAt,
+            lastCommentId: data.commentId || act.lastCommentId,
             proposedComment: commentToSend,
           };
         }
@@ -705,7 +1049,7 @@ export default function App() {
 
       showToast(
         'success',
-        `Comentario publicado en Jira para el ticket ${targetKey} (${jiraConfig.simulationMode ? 'Modo Simulado' : 'Jira Cloud'}).`
+        `Comentario ${item.lastCommentId ? 'actualizado' : 'publicado'} en Jira para el ticket ${targetKey} (${jiraConfig.simulationMode ? 'Modo Simulado' : 'Jira Cloud'}).`
       );
     } catch (err: any) {
       console.error('Error adding comment to Jira:', err);
@@ -929,13 +1273,16 @@ export default function App() {
     showToast('success', `Tema "${source.topicName}" fusionado con éxito en "${target.topicName}".`);
   };
 
-  // Handler: Save Project Settings (Story Points, Categories, Jira Users, Connection)
+  // Handler: Save Project Settings (Story Points, Categories, Jira Users, Connection, Database)
   const handleSaveProjectSettings = (newSettings: ProjectSettings) => {
     setProjectSettings(newSettings);
     saveProjectSettings(newSettings);
+    const dbText = newSettings.database?.enabled && newSettings.database.type !== 'none'
+      ? ` | Persistencia: ${newSettings.database.type.toUpperCase()}`
+      : ' | Persistencia: Local (localStorage)';
     showToast(
       'success',
-      `Configuración guardada: Proyecto ${newSettings.jira.projectKey}, ${newSettings.topicCategories.length} categorías y ${newSettings.jiraUsers.length} usuarios Jira.`
+      `Configuración guardada: Proyecto ${newSettings.jira.projectKey}, ${newSettings.topicCategories.length} categorías${dbText}.`
     );
   };
 
@@ -946,6 +1293,7 @@ export default function App() {
         activeTab={activeTab}
         setActiveTab={setActiveTab}
         jiraConfig={jiraConfig}
+        databaseConfig={projectSettings.database}
         onOpenJiraSettings={() => setIsSettingsOpen(true)}
         hasActiveMeeting={Boolean(activeMeeting)}
         topicsCount={topicsHistory.length}
@@ -1070,6 +1418,8 @@ export default function App() {
             meeting={activeMeeting}
             jiraConfig={jiraConfig}
             jiraUsers={projectSettings.jiraUsers}
+            availableTopics={availableTopics}
+            topicCategories={projectSettings.topicCategories}
             onSyncSingleItem={handleSyncSingleItem}
             onBatchSyncAll={handleBatchSyncAll}
             isBatchSyncing={isBatchSyncing}
@@ -1147,8 +1497,12 @@ export default function App() {
         item={selectedActionItem}
         jiraConfig={jiraConfig}
         jiraUsers={projectSettings.jiraUsers}
+        availableTopics={availableTopics}
+        topicCategories={projectSettings.topicCategories}
         onSyncSingleItem={handleSyncSingleItem}
         onUpdateItem={handleUpdateItem}
+        onUpdateItemInJira={handleUpdateItemInJira}
+        onCreateFromExisting={handleCreateFromExisting}
       />
 
       {/* AI Error Popup Modal */}

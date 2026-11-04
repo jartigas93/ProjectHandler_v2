@@ -1,5 +1,5 @@
 import React, { useState } from 'react';
-import { X, ExternalLink, Check, Copy, Share2, BookOpen, Sparkles, Building2 } from 'lucide-react';
+import { X, ExternalLink, Check, Copy, Share2, AlertCircle } from 'lucide-react';
 import { MeetingAnalysis, JiraConfig } from '../types';
 import { CivicaIsotype } from './CivicaLogo';
 
@@ -20,16 +20,23 @@ export const ConfluencePublishModal: React.FC<ConfluencePublishModalProps> = ({
 
   const [spaceKey, setSpaceKey] = useState<string>(jiraConfig.confluenceSpace || 'PROJ');
   const [pageTitle, setPageTitle] = useState<string>(`Acta de Reunión: ${meeting.meetingTitle} (${meeting.meetingDate})`);
+  const [parentPageId, setParentPageId] = useState<string>('');
   const [isPublishing, setIsPublishing] = useState<boolean>(false);
   const [publishResult, setPublishResult] = useState<{
+    success?: boolean;
     pageUrl?: string;
     pageId?: string;
     message?: string;
+    error?: string;
   } | null>(null);
   const [copiedFormat, setCopiedFormat] = useState(false);
 
+  const cleanDomain = (jiraConfig.domain || 'empresa.atlassian.net')
+    .replace(/^https?:\/\//, '')
+    .replace(/\/$/, '');
+
   const generateConfluenceStorageFormat = () => {
-    return `<h2>📌 Acta de Sesión Técnica - Cívica Software</h2>
+    let html = `<h2>📌 Acta de Sesión Técnica - Cívica Software</h2>
 <p><strong>Reunión:</strong> ${meeting.meetingTitle}<br/>
 <strong>Fecha:</strong> ${meeting.meetingDate}<br/>
 <strong>Proyecto Jira:</strong> ${jiraConfig.projectKey}</p>
@@ -43,10 +50,65 @@ ${meeting.keyDecisions.map((d) => `  <li>${d}</li>`).join('\n')}
 </ul>
 
 <h3>3. Matriz de Tareas y Compromisos Jira</h3>
-<table>
-  <tr><th>Responsable</th><th>Tarea</th><th>Story Points</th><th>Prioridad</th><th>Clave Jira</th></tr>
-${meeting.actionItems.map((a) => `  <tr><td>${a.assignee}</td><td>${a.title}</td><td>${a.storyPoints}</td><td>${a.priority}</td><td>${a.jiraTicketKey || 'Pendiente'}</td></tr>`).join('\n')}
+<table border="1" cellpadding="6" style="border-collapse: collapse; width: 100%;">
+  <thead>
+    <tr style="background-color: #f4f5f7;">
+      <th>Responsable</th>
+      <th>Tema</th>
+      <th>Tarea</th>
+      <th>Story Points</th>
+      <th>Prioridad</th>
+      <th>Clave Jira</th>
+    </tr>
+  </thead>
+  <tbody>
+${meeting.actionItems
+        .map((a) => {
+          const jiraLink = a.jiraTicketKey
+            ? `<a href="https://${cleanDomain}/browse/${a.jiraTicketKey}"><strong>${a.jiraTicketKey}</strong></a>`
+            : '<em>Pendiente</em>';
+          return `    <tr>
+      <td>${a.assignee}</td>
+      <td>${a.topicName || '-'}</td>
+      <td>${a.title}</td>
+      <td style="text-align: center;">${a.storyPoints || 0}</td>
+      <td>${a.priority}</td>
+      <td>${jiraLink}</td>
+    </tr>`;
+        })
+        .join('\n')}
+  </tbody>
 </table>`;
+
+    if (meeting.raciMatrix && meeting.raciMatrix.length > 0) {
+      html += `\n\n<h3>4. Matriz RACI de Responsabilidades</h3>
+<table border="1" cellpadding="6" style="border-collapse: collapse; width: 100%;">
+  <thead>
+    <tr style="background-color: #f4f5f7;">
+      <th>Actividad / Entregable</th>
+      <th>Responsible (R)</th>
+      <th>Accountable (A)</th>
+      <th>Consulted (C)</th>
+      <th>Informed (I)</th>
+    </tr>
+  </thead>
+  <tbody>
+${meeting.raciMatrix
+          .map(
+            (r) => `    <tr>
+      <td><strong>${r.topicOrDeliverable}</strong></td>
+      <td>${r.responsible}</td>
+      <td>${r.accountable}</td>
+      <td>${Array.isArray(r.consulted) ? r.consulted.join(', ') : r.consulted || '-'}</td>
+      <td>${Array.isArray(r.informed) ? r.informed.join(', ') : r.informed || '-'}</td>
+    </tr>`
+          )
+          .join('\n')}
+  </tbody>
+</table>`;
+    }
+
+    return html;
   };
 
   const handleCopyStorage = () => {
@@ -57,22 +119,29 @@ ${meeting.actionItems.map((a) => `  <tr><td>${a.assignee}</td><td>${a.title}</td
 
   const handlePublish = async () => {
     setIsPublishing(true);
+    setPublishResult(null);
     try {
       const res = await fetch('/api/confluence/publish', {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({
+          jiraConfig,
           meetingTitle: meeting.meetingTitle,
           meetingDate: meeting.meetingDate,
           spaceKey,
           pageTitle,
+          parentPageId: parentPageId.trim() || undefined,
           contentHtml: generateConfluenceStorageFormat(),
         }),
       });
       const data = await res.json();
       setPublishResult(data);
-    } catch (err) {
+    } catch (err: any) {
       console.error('Error publishing to Confluence:', err);
+      setPublishResult({
+        success: false,
+        error: err.message || 'Error de conexión con el servidor al publicar.',
+      });
     } finally {
       setIsPublishing(false);
     }
@@ -104,8 +173,8 @@ ${meeting.actionItems.map((a) => `  <tr><td>${a.assignee}</td><td>${a.title}</td
 
         {/* Content */}
         <div className="p-6 space-y-4 text-xs font-['Montserrat']">
-          <div className="grid grid-cols-3 gap-3">
-            <div className="col-span-2">
+          <div className="grid grid-cols-1 md:grid-cols-3 gap-3">
+            <div className="md:col-span-2">
               <label className="block text-[11px] font-semibold text-slate-300 mb-1">
                 Título de la Página en Confluence
               </label>
@@ -113,7 +182,7 @@ ${meeting.actionItems.map((a) => `  <tr><td>${a.assignee}</td><td>${a.title}</td
                 type="text"
                 value={pageTitle}
                 onChange={(e) => setPageTitle(e.target.value)}
-                className="w-full bg-slate-950 border border-slate-700 rounded-lg px-3 py-2 text-white focus:outline-hidden focus:border-[#FF5038]"
+                className="w-full bg-[#141517] border border-[#2A2C2F] rounded-lg px-3 py-2 text-white focus:outline-hidden focus:border-[#FF5038]"
               />
             </div>
             <div>
@@ -125,9 +194,22 @@ ${meeting.actionItems.map((a) => `  <tr><td>${a.assignee}</td><td>${a.title}</td
                 value={spaceKey}
                 onChange={(e) => setSpaceKey(e.target.value.toUpperCase())}
                 placeholder="PROJ o DEV"
-                className="w-full bg-slate-950 border border-slate-700 rounded-lg px-3 py-2 text-white uppercase font-mono focus:outline-hidden focus:border-[#FF5038]"
+                className="w-full bg-[#141517] border border-[#2A2C2F] rounded-lg px-3 py-2 text-white uppercase font-mono focus:outline-hidden focus:border-[#FF5038]"
               />
             </div>
+          </div>
+
+          <div>
+            <label className="block text-[11px] font-semibold text-slate-300 mb-1">
+              ID Página Padre (Opcional)
+            </label>
+            <input
+              type="text"
+              value={parentPageId}
+              onChange={(e) => setParentPageId(e.target.value)}
+              placeholder="Ej: 12345678 (dejar vacío si no cuelga de otra página)"
+              className="w-full bg-[#141517] border border-[#2A2C2F] rounded-lg px-3 py-2 text-white font-mono focus:outline-hidden focus:border-[#FF5038]"
+            />
           </div>
 
           {/* Preview snippet */}
@@ -144,7 +226,7 @@ ${meeting.actionItems.map((a) => `  <tr><td>${a.assignee}</td><td>${a.title}</td
                 <span>{copiedFormat ? '¡Copiado!' : 'Copiar Código HTML/Confluence'}</span>
               </button>
             </div>
-            <div className="bg-[#141517] p-3 rounded-xl border border-[#2A2C2F] text-slate-300 space-y-2 max-h-48 overflow-y-auto font-mono text-[11px] leading-relaxed">
+            <div className="bg-[#141517] p-3 rounded-xl border border-[#2A2C2F] text-slate-300 space-y-2 max-h-40 overflow-y-auto font-mono text-[11px] leading-relaxed">
               <p className="text-white font-bold font-sans">📌 Acta de Sesión Técnica - Cívica Software</p>
               <p className="text-slate-400 font-sans text-[11px]">
                 {meeting.executiveSummary.slice(0, 180)}...
@@ -155,24 +237,34 @@ ${meeting.actionItems.map((a) => `  <tr><td>${a.assignee}</td><td>${a.title}</td
             </div>
           </div>
 
-          {/* Success result */}
+          {/* Success or Error result */}
           {publishResult && (
-            <div className="bg-emerald-950/40 border border-[#29E78C]/40 p-3 rounded-xl flex items-start gap-2 text-emerald-200">
-              <Check className="w-4 h-4 text-[#29E78C] shrink-0 mt-0.5" />
-              <div className="flex-1">
-                <span className="font-bold">{publishResult.message}</span>
-                {publishResult.pageUrl && (
-                  <a
-                    href={publishResult.pageUrl}
-                    target="_blank"
-                    rel="noreferrer"
-                    className="text-xs text-[#29E78C] underline flex items-center gap-1 mt-1 font-medium"
-                  >
-                    Ver página publicada en Confluence <ExternalLink className="w-3 h-3" />
-                  </a>
-                )}
+            publishResult.success ? (
+              <div className="bg-emerald-950/40 border border-[#29E78C]/40 p-3 rounded-xl flex items-start gap-2 text-emerald-200">
+                <Check className="w-4 h-4 text-[#29E78C] shrink-0 mt-0.5" />
+                <div className="flex-1">
+                  <span className="font-bold">{publishResult.message}</span>
+                  {publishResult.pageUrl && (
+                    <a
+                      href={publishResult.pageUrl}
+                      target="_blank"
+                      rel="noreferrer"
+                      className="text-xs text-[#29E78C] underline flex items-center gap-1 mt-1 font-medium"
+                    >
+                      Ver página publicada en Confluence <ExternalLink className="w-3 h-3" />
+                    </a>
+                  )}
+                </div>
               </div>
-            </div>
+            ) : (
+              <div className="bg-rose-950/40 border border-[#FF5038]/40 p-3 rounded-xl flex items-start gap-2 text-rose-200">
+                <AlertCircle className="w-4 h-4 text-[#FF5038] shrink-0 mt-0.5" />
+                <div className="flex-1">
+                  <span className="font-bold">Error al publicar en Confluence:</span>
+                  <p className="text-xs text-rose-300 mt-0.5">{publishResult.error || publishResult.message || 'Error desconocido'}</p>
+                </div>
+              </div>
+            )
           )}
         </div>
 

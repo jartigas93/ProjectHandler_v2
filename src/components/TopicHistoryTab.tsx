@@ -1,4 +1,4 @@
-import React, { useState } from 'react';
+import React, { useState, useMemo } from 'react';
 import {
   History,
   Search,
@@ -27,7 +27,7 @@ import {
 } from 'lucide-react';
 import { TopicHistoryRecord, TopicStatus, JiraUser } from '../types';
 import { exportTopicsToCsv, downloadFile } from '../utils/exportUtils';
-import { DEFAULT_TOPIC_CATEGORIES, DEFAULT_JIRA_USERS } from '../utils/storage';
+import { DEFAULT_TOPIC_CATEGORIES, DEFAULT_JIRA_USERS, matchClosestCategory, normalizeCategoryText } from '../utils/storage';
 import { AutoResizeTextarea } from './AutoResizeTextarea';
 
 interface TopicHistoryTabProps {
@@ -69,6 +69,39 @@ export const TopicHistoryTab: React.FC<TopicHistoryTabProps> = ({
   const effectiveCategories = topicCategories.length > 0 ? topicCategories : DEFAULT_TOPIC_CATEGORIES;
   const effectiveJiraUsers = jiraUsers.length > 0 ? jiraUsers : DEFAULT_JIRA_USERS;
 
+  // Unify all categories present in existing topics + configured ones
+  const allAvailableFilterCategories = useMemo(() => {
+    return Array.from(
+      new Set([...effectiveCategories, ...topics.map((t) => t.category).filter(Boolean)])
+    );
+  }, [effectiveCategories, topics]);
+
+  const unconfiguredTopics = useMemo(() => {
+    return topics.filter((t) => !effectiveCategories.includes(t.category));
+  }, [topics, effectiveCategories]);
+  const hasUnconfiguredCategories = unconfiguredTopics.length > 0;
+
+  const handleCategoryChange = (topic: TopicHistoryRecord, newCategory: string) => {
+    onUpdateTopic({
+      ...topic,
+      category: newCategory,
+      updatedAt: new Date().toISOString(),
+    });
+  };
+
+  const handleNormalizeAllCategories = () => {
+    topics.forEach((t) => {
+      const closest = matchClosestCategory(t.category, effectiveCategories);
+      if (closest !== t.category) {
+        onUpdateTopic({
+          ...t,
+          category: closest,
+          updatedAt: new Date().toISOString(),
+        });
+      }
+    });
+  };
+
   // New topic modal form
   const [newTopicForm, setNewTopicForm] = useState({
     topicName: '',
@@ -84,7 +117,10 @@ export const TopicHistoryTab: React.FC<TopicHistoryTabProps> = ({
       t.category.toLowerCase().includes(searchTerm.toLowerCase()) ||
       t.leadParticipant.toLowerCase().includes(searchTerm.toLowerCase());
     const matchesStatus = statusFilter === 'all' || t.status === statusFilter;
-    const matchesCategory = categoryFilter === 'all' || t.category === categoryFilter;
+    const matchesCategory =
+      categoryFilter === 'all' ||
+      t.category === categoryFilter ||
+      normalizeCategoryText(t.category) === normalizeCategoryText(categoryFilter);
     return matchesSearch && matchesStatus && matchesCategory;
   });
 
@@ -246,6 +282,29 @@ export const TopicHistoryTab: React.FC<TopicHistoryTabProps> = ({
         </div>
       </div>
 
+      {/* Warning & One-click Normalization Banner for unconfigured categories */}
+      {hasUnconfiguredCategories && (
+        <div className="bg-[#241F18] border border-[#EE880E]/40 rounded-2xl p-4 flex flex-col sm:flex-row items-start sm:items-center justify-between gap-3 text-xs shadow-sm">
+          <div className="flex items-center gap-2.5">
+            <AlertTriangle className="w-5 h-5 text-[#EE880E] shrink-0" />
+            <div>
+              <span className="font-bold text-white block">
+                Se detectaron {unconfiguredTopics.length} tema{unconfiguredTopics.length > 1 ? 's' : ''} con categorías no estandarizadas
+              </span>
+              <span className="text-slate-400 text-[11px] block mt-0.5">
+                Algunos temas tienen categorías fuera de las {effectiveCategories.length} configuradas en el proyecto (ej: &ldquo;Arquitectura de Datos&rdquo; vs &ldquo;Arquitectura &amp; Datos&rdquo;).
+              </span>
+            </div>
+          </div>
+          <button
+            onClick={handleNormalizeAllCategories}
+            className="px-3.5 py-1.5 bg-gradient-to-r from-[#FF5038] to-[#EE880E] hover:from-[#E6422C] hover:to-[#DE7B0A] text-white font-bold text-xs rounded-xl shadow-xs transition-all shrink-0 font-['Lato']"
+          >
+            Normalizar a Categorías Oficiales
+          </button>
+        </div>
+      )}
+
       {/* Filter and Search Bar */}
       <div className="bg-[#1C1E20] border border-[#2E3135] rounded-2xl p-4 flex flex-col md:flex-row items-stretch md:items-center justify-between gap-3 shadow-sm">
         <div className="relative flex-1">
@@ -267,9 +326,9 @@ export const TopicHistoryTab: React.FC<TopicHistoryTabProps> = ({
             className="bg-[#25282B] border border-[#3E4247] rounded-lg px-2.5 py-1.5 text-xs text-slate-300 focus:outline-hidden focus:border-[#FF5038]"
           >
             <option value="all">Todas las Categorías</option>
-            {effectiveCategories.map((c) => (
+            {allAvailableFilterCategories.map((c) => (
               <option key={c} value={c}>
-                {c}
+                {c} {!effectiveCategories.includes(c) ? '(No configurada)' : ''}
               </option>
             ))}
           </select>
@@ -319,8 +378,18 @@ export const TopicHistoryTab: React.FC<TopicHistoryTabProps> = ({
                 <div className="p-5 flex flex-col md:flex-row items-start md:items-center justify-between gap-4">
                   <div className="space-y-1.5 flex-1">
                     <div className="flex flex-wrap items-center gap-2">
-                      <span className="text-[11px] bg-slate-800 text-slate-300 px-2.5 py-0.5 rounded-md font-medium border border-slate-700/80">
-                        {topic.category}
+                      <span
+                        className={`text-[11px] px-2.5 py-0.5 rounded-md font-medium border flex items-center gap-1 ${
+                          effectiveCategories.includes(topic.category)
+                            ? 'bg-slate-800 text-slate-300 border-slate-700/80'
+                            : 'bg-[#2E2016] text-[#EE880E] border-[#EE880E]/50'
+                        }`}
+                        title={!effectiveCategories.includes(topic.category) ? 'Categoría no estándar: haz clic en Historial & Notas para corregirla' : undefined}
+                      >
+                        <span>{topic.category}</span>
+                        {!effectiveCategories.includes(topic.category) && (
+                          <span className="text-[10px] text-[#EE880E] font-bold">⚠️</span>
+                        )}
                       </span>
                       <span className={`text-[11px] px-2.5 py-0.5 rounded-md font-semibold border ${getStatusBadge(topic.status)}`}>
                         {topic.status}
@@ -441,20 +510,40 @@ export const TopicHistoryTab: React.FC<TopicHistoryTabProps> = ({
                   <div className="px-5 pb-5 pt-3 border-t border-slate-800/80 bg-slate-950/40 space-y-5 animate-in fade-in duration-150">
                     {/* Status & Progress Quick Adjust */}
                     <div className="flex flex-wrap items-center justify-between gap-3 bg-slate-900 p-3 rounded-xl border border-slate-800 text-xs">
-                      <div className="flex items-center gap-2">
-                        <span className="text-slate-400 font-medium">Actualizar Estado:</span>
-                        {(['En Progreso', 'Completado', 'Bloqueado', 'Pendiente'] as TopicStatus[]).map((st) => (
-                          <button
-                            key={st}
-                            onClick={() => handleStatusChange(topic, st)}
-                            className={`px-2.5 py-1 rounded-md text-[11px] font-semibold border transition-all ${topic.status === st
-                                ? getStatusBadge(st)
-                                : 'bg-slate-950 border-slate-800 text-slate-400 hover:text-white'
-                              }`}
+                      <div className="flex flex-wrap items-center gap-3">
+                        <div className="flex items-center gap-1.5">
+                          <span className="text-slate-400 font-medium">Estado:</span>
+                          {(['En Progreso', 'Completado', 'Bloqueado', 'Pendiente'] as TopicStatus[]).map((st) => (
+                            <button
+                              key={st}
+                              onClick={() => handleStatusChange(topic, st)}
+                              className={`px-2.5 py-1 rounded-md text-[11px] font-semibold border transition-all ${topic.status === st
+                                  ? getStatusBadge(st)
+                                  : 'bg-slate-950 border-slate-800 text-slate-400 hover:text-white'
+                                }`}
+                            >
+                              {st}
+                            </button>
+                          ))}
+                        </div>
+
+                        <div className="flex items-center gap-1.5 pl-2 border-l border-slate-800">
+                          <span className="text-slate-400 font-medium">Categoría:</span>
+                          <select
+                            value={topic.category}
+                            onChange={(e) => handleCategoryChange(topic, e.target.value)}
+                            className="bg-slate-950 border border-slate-700 rounded-lg px-2.5 py-1 text-[11px] text-white focus:outline-hidden focus:border-[#FF5038]"
                           >
-                            {st}
-                          </button>
-                        ))}
+                            {effectiveCategories.map((c) => (
+                              <option key={c} value={c}>
+                                {c}
+                              </option>
+                            ))}
+                            {!effectiveCategories.includes(topic.category) && (
+                              <option value={topic.category}>{topic.category} (No configurada)</option>
+                            )}
+                          </select>
+                        </div>
                       </div>
 
                       <div className="flex items-center gap-2">

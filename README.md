@@ -22,11 +22,17 @@
    - [División de Criterios de Aceptación (Split Criteria)](#división-de-criterios-de-aceptación-split-criteria)
    - [Vinculación Nativa en Jira Cloud (Issue Linking) y Grafo de Dependencias](#vinculación-nativa-en-jira-cloud-issue-linking-y-grafo-de-dependencias)
    - [Selector de Épica Padre (Parent Epic)](#selector-de-épica-padre-parent-epic)
+   - [Filtros Avanzados por Tema y Épica en el Resumen](#filtros-avanzados-por-tema-y-épica-en-el-resumen)
+   - [Compartir Resumen Ejecutivo por Correo Electrónico (`EmailShareModal`)](#compartir-resumen-ejecutivo-por-correo-electrónico-emailsharemodal)
+   - [Persistencia de Sesión Activa ante Recarga de Navegador (F5)](#persistencia-de-sesión-activa-ante-recarga-de-navegador-f5)
+   - [Estandarización y Normalización de Categorías de Temas](#estandarización-y-normalización-de-categorías-de-temas)
    - [Campos de Texto con Auto-Ajuste de Altura Dinámico (AutoResizeTextarea)](#campos-de-texto-con-auto-ajuste-de-altura-dinámico-autoresizetextarea)
    - [Histórico de Reuniones y Seguimiento de Temas](#histórico-de-reuniones-y-seguimiento-de-temas)
    - [Generación de Informes Mensuales Consolidados](#generación-de-informes-mensuales-consolidados)
 4. [Guía Técnica (Para Desarrolladores, Arquitectos y DevOps)](#-guía-técnica-para-desarrolladores-arquitectos-y-devops)
    - [Motor de Inteligencia Artificial Multi-Proveedor](#motor-de-inteligencia-artificial-multi-proveedor)
+   - [Resiliencia Multi-Proveedor con Fallback Automático](#resiliencia-multi-proveedor-con-fallback-automático)
+   - [Modularización de Servicios Backend (`server/services/`)](#modularización-de-servicios-backend-serverservices)
    - [Configuración de Modelos de Fábrica desde `.env`](#configuración-de-modelos-de-fábrica-desde-env)
    - [Modelos Personalizados y Validación en Tiempo Real](#modelos-personalizados-y-validación-en-tiempo-real)
    - [Manejo de Errores de API y Modal Informativo](#manejo-de-errores-de-api-y-modal-informativo)
@@ -329,6 +335,56 @@ Para asegurar que las historias y tareas se organicen bajo la jerarquía ágil c
 
 ---
 
+### Filtros Avanzados por Tema y Épica en el Resumen
+
+Para agilizar el análisis en sesiones de alta densidad y con múltiples líneas de trabajo concurrentes, la barra de herramientas de la pestaña de resumen incorpora filtros de segmentación en vivo:
+
+1. **Filtro por Tema de Negocio:** Menú desplegable dinámico que extrae todos los temas identificados en la sesión y permite enfocar la vista en una iniciativa concreta (ej. *Ingesta Babel*, *Business Dims*, *Modelado GA4*).
+2. **Filtro por Épica Asociada:** Permite aislar todas las tareas vinculadas a una épica padre específica del tablero de Jira.
+3. **Búsqueda Multicriterio en Tiempo Real:** Campo de búsqueda rápida que evalúa simultáneamente el título de la tarea, el nombre del responsable, la descripción y los criterios de aceptación.
+4. **Segmentación por Estado y Naturaleza:** Botones de alternancia rápida para filtrar por estado de sincronización (*Todas*, *Sincronizadas*, *Pendientes*) y por tipo de tarea (*Todas*, *Nuevas*, *En Curso*).
+
+---
+
+### Compartir Resumen Ejecutivo por Correo Electrónico (`EmailShareModal`)
+
+Para facilitar la comunicación formal hacia clientes, comités y participantes externos sin fricción:
+
+1. **Modal de Redacción Ejecutiva:** Accesible desde el botón **"Compartir por mail"** en la barra superior del resumen de reunión.
+2. **Estructura Corporativa Limpia:** Genera un correo profesional, desprovisto de emoticones informales, organizado en secciones claras:
+   - Asunto estandarizado con el título y fecha de la sesión.
+   - Saludo institucional.
+   - Resumen ejecutivo consolidado.
+   - Acuerdos clave y decisiones adoptadas.
+   - Tabla de tareas y compromisos distribuidos por responsable, prioridad y estado.
+3. **Acciones Rápidas de Envío:**
+   - **Copiar al Portapapeles:** Copia el texto formateado listo para pegar en clientes de correo web o de escritorio.
+   - **Abrir en Cliente de Correo (`mailto:`):** Prepara automáticamente un nuevo mensaje con el asunto y el cuerpo ya cargados en el cliente predeterminado (Outlook, Thunderbird, Mail).
+
+---
+
+### Persistencia de Sesión Activa ante Recarga de Navegador (F5)
+
+Para garantizar la continuidad operativa ante recargas accidentales de página, cambios de pestaña o cierres de sesión en el navegador:
+
+1. **Almacenamiento Reactivo del Estado Activo:** La aplicación sincroniza en tiempo real la reunión activa analizada, sus tareas, dependencias, matriz RACI y la pestaña seleccionada en el almacenamiento local seguro (`teams2jira_active_meeting`).
+2. **Restauración Instantánea:** Al presionar `F5` o reabrir el navegador, ProjectHandler restaura inmediatamente la sesión en curso exactamente en el mismo estado en que se encontraba, preservando selecciones, comentarios editados y progreso de sincronización.
+3. **Indicador de Estado Vivo:** La barra de navegación destaca con un distintivo verde pulsante (`animate-pulse`) cuando existe una reunión activa en memoria, permitiendo volver a ella con un solo clic.
+
+---
+
+### Estandarización y Normalización de Categorías de Temas
+
+Para asegurar la coherencia entre las categorías configuradas en el proyecto y las iniciativas generadas a través del análisis de reuniones:
+
+1. **Categorización Dirigida por Configuración:** El motor de IA recibe el catálogo oficial de categorías definidas en el proyecto (ej. *Backend & APIs*, *DevOps & Cloud*, *Arquitectura & Datos*, *Seguridad & Compliance*, *QA & Automatización*, *Gestión & Producto*, *Reingeniería*, *IA*) y clasifica de forma obligatoria los temas y la matriz RACI dentro de este conjunto.
+2. **Normalización Inteligente (`matchClosestCategory`):** Implementa un evaluador lingüístico tolerante que mapea automáticamente variantes ortográficas o sinónimos al nombre canónico configurado (por ejemplo, homologa variantes de conectores como `&` vs `y` o preposiciones).
+3. **Filtro Tolerante en el Histórico de Temas:** El selector de búsqueda en el histórico unifica las variantes de redacción, asegurando que al filtrar por una categoría se presenten todas las iniciativas correspondientes.
+4. **Normalización Masiva en 1 Clic:** Si existen temas históricos registrados con clasificaciones previas, el sistema despliega un banner informativo con el botón **"Normalizar a Categorías Oficiales"**, actualizando todos los registros de manera uniforme.
+5. **Reasignación Manual por Tema:** Cada tarjeta en el Histórico de Temas permite redefinir individualmente su categoría desde el panel expandido de *Historial & Notas*.
+
+---
+
 ### Campos de Texto con Auto-Ajuste de Altura Dinámico (AutoResizeTextarea)
 
 Para optimizar la ergonomía y legibilidad de especificaciones técnicas extensas:
@@ -376,6 +432,27 @@ ProjectHandler cuenta con un motor unificado en [[server.ts]] capaz de interoper
 2. **OpenAI:** Llamadas a `/v1/chat/completions` con `response_format: { type: 'json_object' }`.
 3. **Microsoft Copilot / Azure OpenAI:** Conexión empresarial mediante endpoint dedicado, nombre de despliegue (`deployment`) y versión de API (`api-version`).
 4. **Google Gemini:** Utilización del SDK oficial `@google/genai` con respuesta forzada a `application/json`.
+
+---
+
+### Resiliencia Multi-Proveedor con Fallback Automático
+
+Para garantizar alta disponibilidad y continuidad en el procesamiento de transcripciones extensas ante posibles saturaciones de demanda externa en los proveedores de IA:
+
+1. **Conmutación Inteligente entre Modelos:** Si el modelo seleccionado experimenta picos de demanda o restricciones temporales de cuota, el adaptador del backend (`callAIProvider`) conmuta de forma automática y transparente hacia modelos de alta velocidad y capacidad equivalente dentro del mismo proveedor (por ejemplo, conmutación automática hacia familias flash de alta disponibilidad) o proveedores secundarios configurados.
+2. **Reintentos Exponenciales Transparentes:** El sistema aplica políticas de reintento con retroceso gradual (*exponential backoff*) antes de reportar incidencias al usuario.
+3. **Preservación del Esquema JSON:** Cada alternativa de modelo ejecuta la misma especificación estricta de salida JSON, garantizando que el resumen ejecutivo, los action items, la matriz RACI y los compromisos huérfanos se mantengan con integridad dimensional.
+
+---
+
+### Modularización de Servicios Backend (`server/services/`)
+
+La arquitectura del backend se organiza en módulos de servicios desacoplados y especializados dentro del directorio `server/`:
+
+1. **`server/services/aiProviders.ts`:** Orquestación agnóstica de llamadas a LLMs (Claude, OpenAI, Azure Copilot y Gemini), parsing robusto de respuestas JSON, detección de nombres humanos y resiliencia de modelos.
+2. **`server/services/jiraAdf.ts`:** Generación pura de estructuras Atlassian Document Format (ADF v1) para descripciones y comentarios de incidencias en Jira Cloud.
+3. **`server/services/jiraCloud.ts`:** Integración REST con Jira Cloud y Confluence: descubrimiento dinámico de campos de Story Points, resolución de `accountId` de asignados, vinculación nativa de incidencias (`Issue Linking`), consulta JQL de tableros y publicación de actas.
+4. **`server/db/agnosticDb.ts`:** Conectores multi-motor para persistencia centralizada opcional (PostgreSQL, MySQL, SQLite, Snowflake, MongoDB).
 
 ---
 
@@ -474,9 +551,15 @@ Si el usuario no dispone de credenciales de Jira Cloud o activa el interruptor d
 | `POST` | `/api/jira/update-issue` | Modifica una incidencia existente en Jira Cloud (resumen, descripción, criterios de aceptación, prioridad, responsable, etiquetas y Épica Padre). |
 | `POST` | `/api/jira/add-comment` | Publica o actualiza un comentario en formato ADF con estructura de avance y criterios de aceptación sin duplicados. |
 | `POST` | `/api/jira/sync-statuses` | Recupera el estado actualizado de un listado de claves de Jira. |
-| `POST` | `/api/confluence/publish-page` | Publica un acta de reunión en el espacio de Confluence indicado. |
+| `POST` | `/api/confluence/publish` | Publica o actualiza un acta de reunión en Confluence Cloud (`/wiki/rest/api/content`) o SharePoint. |
 | `POST` | `/api/teams/webhook` | Recepción de transcripciones emitidas por Microsoft Power Automate. |
 | `GET` | `/api/teams/latest-webhook` | Consulta de la última transcripción recibida vía Webhook. |
+| `POST` | `/api/db/test-connection` | Valida conectividad y latencia contra el motor de base de datos configurado (PostgreSQL, Snowflake, MySQL, SQLite). |
+| `GET` | `/api/db/env-config` | Consulta si existe configuración de persistencia provista mediante variables de entorno del servidor. |
+| `POST` | `/api/db/data` | Recupera colecciones de datos (reuniones, temas, reportes) desde la base de datos central. |
+| `POST` | `/api/db/save` | Inserta o actualiza un registro en la base de datos centralizada. |
+| `POST` | `/api/db/delete` | Elimina un registro de la base de datos centralizada. |
+| `POST` | `/api/db/migrate` | Migración masiva por lotes desde el cliente hacia la base de datos centralizada. |
 
 ---
 
@@ -570,7 +653,14 @@ ProjectHandler/
 ├── .env.example                # Plantilla de variables de entorno
 ├── index.html                  # Plantilla HTML base
 ├── package.json                # Dependencias, scripts y metadatos del proyecto
-├── server.ts                   # Backend Express: orquestación de LLMs, APIs Jira/Confluence y Webhooks
+├── server.ts                   # Backend Express: enrutador HTTP limpio y ciclo de vida
+├── server/
+│   ├── db/
+│   │   └── agnosticDb.ts       # Conectores multi-motor (PostgreSQL, Snowflake, MySQL, SQLite, MongoDB)
+│   └── services/               # Módulos especializados de servicios backend
+│       ├── aiProviders.ts      # LLM Engine: adaptadores Claude, OpenAI, Azure Copilot y Gemini
+│       ├── jiraAdf.ts          # Generadores puros de documentos Atlassian Document Format (ADF v1)
+│       └── jiraCloud.ts        # Jira & Confluence Cloud REST API (Story Points, Assignees, Links, Board)
 ├── tsconfig.json               # Configuración del compilador TypeScript
 ├── vite.config.ts              # Configuración de Vite y plugins
 └── src/

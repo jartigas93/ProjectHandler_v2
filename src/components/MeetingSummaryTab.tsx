@@ -1,4 +1,4 @@
-import React, { useState } from 'react';
+import React, { useState, useMemo } from 'react';
 import {
   Sparkles,
   User,
@@ -101,6 +101,8 @@ export const MeetingSummaryTab: React.FC<MeetingSummaryTabProps> = ({
   const [selectedPriority, setSelectedPriority] = useState<string>('all');
   const [selectedStatus, setSelectedStatus] = useState<'all' | 'synced' | 'pending'>('all');
   const [selectedKind, setSelectedKind] = useState<'all' | 'new' | 'existing'>('all');
+  const [selectedTopic, setSelectedTopic] = useState<string>('all');
+  const [selectedEpic, setSelectedEpic] = useState<string>('all');
 
   const [copiedTeamsMsg, setCopiedTeamsMsg] = useState(false);
   const [isEmailModalOpen, setIsEmailModalOpen] = useState(false);
@@ -157,6 +159,23 @@ export const MeetingSummaryTab: React.FC<MeetingSummaryTabProps> = ({
     }
   };
 
+  // Available topics and epics in current meeting
+  const availableMeetingTopics = useMemo(() => {
+    const topics = new Set<string>();
+    meeting.actionItems.forEach((i) => {
+      if (i.topicName?.trim()) topics.add(i.topicName.trim());
+    });
+    return Array.from(topics).sort();
+  }, [meeting.actionItems]);
+
+  const availableMeetingEpics = useMemo(() => {
+    const epics = new Set<string>();
+    meeting.actionItems.forEach((i) => {
+      if (i.epicKey?.trim()) epics.add(i.epicKey.trim());
+    });
+    return Array.from(epics).sort();
+  }, [meeting.actionItems]);
+
   // Filter items
   const filteredActionItems = meeting.actionItems.filter((item) => {
     if (selectedParticipant !== 'all' && item.assignee.toLowerCase() !== selectedParticipant.toLowerCase()) {
@@ -186,6 +205,13 @@ export const MeetingSummaryTab: React.FC<MeetingSummaryTabProps> = ({
     }
     if (selectedKind === 'existing' && item.taskKind !== 'existing' && !item.matchedJiraKey) {
       return false;
+    }
+    if (selectedTopic !== 'all' && item.topicName !== selectedTopic) {
+      return false;
+    }
+    if (selectedEpic !== 'all') {
+      if (selectedEpic === 'none' && item.epicKey) return false;
+      if (selectedEpic !== 'none' && item.epicKey !== selectedEpic) return false;
     }
     return true;
   });
@@ -275,6 +301,8 @@ export const MeetingSummaryTab: React.FC<MeetingSummaryTabProps> = ({
     setSelectedPriority('all');
     setSelectedStatus('all');
     setSelectedKind('all');
+    setSelectedTopic('all');
+    setSelectedEpic('all');
   };
 
   const hasActiveFilters =
@@ -282,7 +310,9 @@ export const MeetingSummaryTab: React.FC<MeetingSummaryTabProps> = ({
     searchQuery.trim().length > 0 ||
     selectedPriority !== 'all' ||
     selectedStatus !== 'all' ||
-    selectedKind !== 'all';
+    selectedKind !== 'all' ||
+    selectedTopic !== 'all' ||
+    selectedEpic !== 'all';
 
   return (
     <div className="space-y-6 font-['Montserrat'] animate-in fade-in duration-150">
@@ -739,6 +769,35 @@ export const MeetingSummaryTab: React.FC<MeetingSummaryTabProps> = ({
                   <option value="new">Solo Nuevas ({newTasksCount})</option>
                   <option value="existing">Solo En Curso Jira ({existingTasksCount})</option>
                 </select>
+
+                {availableMeetingTopics.length > 0 && (
+                  <select
+                    value={selectedTopic}
+                    onChange={(e) => setSelectedTopic(e.target.value)}
+                    className="bg-[#141517] border border-[#2A2C2F] rounded-xl px-2.5 py-1.5 text-xs text-slate-300 focus:outline-hidden focus:border-[#FF5038] max-w-[160px] truncate"
+                    title="Filtrar por Tema"
+                  >
+                    <option value="all">Tema: Todos</option>
+                    {availableMeetingTopics.map((t) => (
+                      <option key={t} value={t}>{t}</option>
+                    ))}
+                  </select>
+                )}
+
+                {availableMeetingEpics.length > 0 && (
+                  <select
+                    value={selectedEpic}
+                    onChange={(e) => setSelectedEpic(e.target.value)}
+                    className="bg-[#141517] border border-[#2A2C2F] rounded-xl px-2.5 py-1.5 text-xs text-slate-300 focus:outline-hidden focus:border-[#FF5038]"
+                    title="Filtrar por Épica Padre"
+                  >
+                    <option value="all">Épica: Todas</option>
+                    <option value="none">Sin Épica</option>
+                    {availableMeetingEpics.map((ep) => (
+                      <option key={ep} value={ep}>{ep}</option>
+                    ))}
+                  </select>
+                )}
 
                 {hasActiveFilters && (
                   <button

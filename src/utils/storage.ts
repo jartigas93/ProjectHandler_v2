@@ -76,6 +76,84 @@ export const DEFAULT_TOPIC_CATEGORIES: string[] = [
   'Gestión & Producto',
 ];
 
+export function normalizeCategoryText(text: string): string {
+  return (text || '')
+    .toLowerCase()
+    .normalize('NFD')
+    .replace(/[\u0300-\u036f]/g, '')
+    .replace(/&/g, ' y ')
+    .replace(/\s+de\s+/g, ' y ')
+    .replace(/[^a-z0-9]/g, ' ')
+    .replace(/\s+/g, ' ')
+    .trim();
+}
+
+export function matchClosestCategory(rawCategory: string, availableCategories: string[]): string {
+  if (!availableCategories || availableCategories.length === 0) return rawCategory || 'General';
+  const cleanRaw = (rawCategory || '').trim();
+  if (!cleanRaw) return availableCategories[0];
+
+  // 1. Exact match (case-insensitive)
+  const exact = availableCategories.find((c) => c.toLowerCase() === cleanRaw.toLowerCase());
+  if (exact) return exact;
+
+  // 2. Normalized match (accents, &, 'de'/'y', punctuation)
+  const normRaw = normalizeCategoryText(cleanRaw);
+  const normalizedMatch = availableCategories.find((c) => normalizeCategoryText(c) === normRaw);
+  if (normalizedMatch) return normalizedMatch;
+
+  // 3. Keyword / Substring heuristics
+  const rawWords = normRaw.split(' ').filter((w) => w.length > 2);
+  let bestCategory = '';
+  let bestScore = 0;
+
+  for (const cat of availableCategories) {
+    const normCat = normalizeCategoryText(cat);
+    let score = 0;
+    if (normCat.includes(normRaw) || normRaw.includes(normCat)) score += 6;
+    for (const rw of rawWords) {
+      if (normCat.includes(rw)) score += 3;
+    }
+    // High-confidence business domain mappings
+    if (normRaw.includes('arquitectura') && normCat.includes('arquitectura')) score += 10;
+    if (
+      (normRaw.includes('infraestructura') || normRaw.includes('pipeline') || normRaw.includes('cloud') || normRaw.includes('devops')) &&
+      (normCat.includes('devops') || normCat.includes('cloud'))
+    ) score += 10;
+    if (
+      (normRaw.includes('calidad') || normRaw.includes('qa') || normRaw.includes('test') || normRaw.includes('validacion')) &&
+      normCat.includes('qa')
+    ) score += 10;
+    if (
+      (normRaw.includes('reingenieria') || normRaw.includes('refactor') || normRaw.includes('migracion')) &&
+      normCat.includes('reingenieria')
+    ) score += 10;
+    if (
+      (normRaw.includes('ia') || normRaw.includes('inteligencia') || normRaw.includes('ml')) &&
+      normCat.includes('ia')
+    ) score += 10;
+    if (
+      (normRaw.includes('backend') || normRaw.includes('api') || normRaw.includes('servicio')) &&
+      normCat.includes('backend')
+    ) score += 10;
+    if (
+      (normRaw.includes('frontend') || normRaw.includes('ui') || normRaw.includes('ux') || normRaw.includes('interfaz')) &&
+      normCat.includes('frontend')
+    ) score += 10;
+
+    if (score > bestScore) {
+      bestScore = score;
+      bestCategory = cat;
+    }
+  }
+
+  if (bestScore >= 3 && bestCategory) {
+    return bestCategory;
+  }
+
+  return availableCategories[0];
+}
+
 export const DEFAULT_JIRA_CONFIG: JiraConfig = {
   domain: 'civicasoftware.atlassian.net',
   projectKey: 'PAY',
@@ -174,24 +252,33 @@ export const AVAILABLE_AI_MODELS: AIModelOption[] = [
 
   // Google Gemini
   {
-    id: 'gemini-2.5-flash',
-    name: 'Gemini 2.5 Flash',
+    id: 'gemini-3.6-flash',
+    name: 'Gemini 3.6 Flash',
     provider: 'gemini',
-    description: 'Procesamiento de contexto ultra amplio con baja latencia en Google AI Studio.',
+    description: 'Alta velocidad y precisión analítica, máxima disponibilidad sin congestión.',
+    speed: 'rápido',
+    badge: 'Recomendado',
+  },
+  {
+    id: 'gemini-3.5-flash-lite',
+    name: 'Gemini 3.5 Flash Lite',
+    provider: 'gemini',
+    description: 'Ultrarrápido y liviano (~600ms), diseñado para respuestas instantáneas.',
+    speed: 'rápido',
+    badge: 'Ultra Rápido',
+  },
+  {
+    id: 'gemini-flash-lite-latest',
+    name: 'Gemini Flash Lite (Latest)',
+    provider: 'gemini',
+    description: 'Versión lite continua de alta resiliencia ante picos de demanda.',
     speed: 'rápido',
   },
   {
-    id: 'gemini-2.5-pro',
-    name: 'Gemini 2.5 Pro',
+    id: 'gemini-3.8-flash',
+    name: 'Gemini 3.8 Flash',
     provider: 'gemini',
-    description: 'Razonamiento profundo y auditoría de decisiones complejas.',
-    speed: 'máximo',
-  },
-  {
-    id: 'gemini-1.5-flash',
-    name: 'Gemini 1.5 Flash',
-    provider: 'gemini',
-    description: 'Estable y veloz para transcripciones extensas de Teams.',
+    description: 'Modelo insignia experimental de Google con fallback automático ante alta demanda.',
     speed: 'rápido',
   },
 ];
@@ -308,6 +395,32 @@ export function deleteSavedMeeting(meetingId: string): void {
     localStorage.setItem(STORAGE_KEYS.MEETINGS, JSON.stringify(updated));
   } catch (e) {
     console.error('Error deleting meeting from localStorage:', e);
+  }
+}
+
+export function saveActiveMeetingSession(meetingId: string | null, activeTab?: string): void {
+  try {
+    if (meetingId) {
+      localStorage.setItem(STORAGE_KEYS.ACTIVE_MEETING, meetingId);
+    } else {
+      localStorage.removeItem(STORAGE_KEYS.ACTIVE_MEETING);
+    }
+    if (activeTab) {
+      localStorage.setItem('teams2jira_active_tab', activeTab);
+    }
+  } catch (e) {
+    console.warn('Error saving active meeting session:', e);
+  }
+}
+
+export function loadActiveMeetingSession(): { activeMeetingId: string | null; activeTab: string | null } {
+  try {
+    return {
+      activeMeetingId: localStorage.getItem(STORAGE_KEYS.ACTIVE_MEETING),
+      activeTab: localStorage.getItem('teams2jira_active_tab'),
+    };
+  } catch {
+    return { activeMeetingId: null, activeTab: null };
   }
 }
 

@@ -5,6 +5,20 @@ import path from 'path';
 import { fileURLToPath } from 'url';
 import { GoogleGenAI, Type } from '@google/genai';
 import { agnosticDb, DatabaseConfig } from './server/db/agnosticDb';
+import { buildIssueDescriptionAdf, buildCommentAdf } from './server/services/jiraAdf';
+import {
+  discoverStoryPointsFieldId,
+  resolveJiraAssigneeAccountId,
+  linkJiraIssuesInCloud,
+  fetchBoardContext,
+  publishToConfluenceCloud,
+} from './server/services/jiraCloud';
+import {
+  callAIProvider,
+  describeAiError,
+  parseLlmJsonResponse,
+  isNonPersonName,
+} from './server/services/aiProviders';
 
 dotenv.config();
 
@@ -61,11 +75,14 @@ const FACTORY_METADATA_CATALOG: Record<string, { name: string; description: stri
   'o3-mini': { name: 'o3-mini (Reasoning)', description: 'Razonamiento lógico avanzado para reuniones técnicas y arquitectónicas.', speed: 'máximo' },
   'copilot-gpt-4o': { name: 'Copilot (Azure GPT-4o)', description: 'Integración empresarial Microsoft Copilot / Azure OpenAI corporativo.', speed: 'equilibrado', badge: 'Empresarial' },
   'copilot-gpt-4o-mini': { name: 'Copilot (Azure GPT-4o Mini)', description: 'Despliegue ágil en entorno seguro Azure de la organización.', speed: 'rápido' },
+  'gemini-3.6-flash': { name: 'Gemini 3.6 Flash', description: 'Alta velocidad y precisión analítica, máxima disponibilidad sin congestión.', speed: 'rápido', badge: 'Recomendado' },
+  'gemini-3.5-flash-lite': { name: 'Gemini 3.5 Flash Lite', description: 'Ultrarrápido y liviano (~600ms), diseñado para respuestas instantáneas.', speed: 'rápido', badge: 'Ultra Rápido' },
+  'gemini-flash-lite-latest': { name: 'Gemini Flash Lite (Latest)', description: 'Versión lite continua de alta resiliencia ante picos de demanda.', speed: 'rápido' },
+  'gemini-3.8-flash': { name: 'Gemini 3.8 Flash', description: 'Modelo insignia experimental de Google con fallback automático ante alta demanda.', speed: 'rápido' },
+  'gemini-3.1-flash-lite': { name: 'Gemini 3.1 Flash Lite', description: 'Modelo ultrarrápido y liviano de última generación.', speed: 'rápido' },
   'gemini-2.5-flash': { name: 'Gemini 2.5 Flash', description: 'Procesamiento de contexto ultra amplio con baja latencia en Google AI Studio.', speed: 'rápido' },
   'gemini-2.5-pro': { name: 'Gemini 2.5 Pro', description: 'Razonamiento profundo y auditoría de decisiones complejas.', speed: 'máximo' },
   'gemini-1.5-flash': { name: 'Gemini 1.5 Flash', description: 'Estable y veloz para transcripciones extensas de Teams.', speed: 'rápido' },
-  'gemini-3.8-flash': { name: 'Gemini 3.8 Flash', description: 'Modelo insignia de Google de ultra alta velocidad y contexto extendido.', speed: 'rápido', badge: 'Recomendado' },
-  'gemini-3.1-flash-lite': { name: 'Gemini 3.1 Flash Lite', description: 'Modelo ultrarrápido y liviano de última generación.', speed: 'rápido', badge: 'Nuevo' },
 };
 
 function parseEnvModelList(envVal: string | undefined, defaultList: string[]): string[] {
@@ -79,10 +96,10 @@ function parseEnvModelList(envVal: string | undefined, defaultList: string[]): s
 // Endpoint: Configurable Factory Models from .env
 app.get('/api/ai/models', (_req: Request, res: Response) => {
   const geminiList = parseEnvModelList(process.env.FACTORY_MODELS_GEMINI, [
+    'gemini-3.6-flash',
+    'gemini-3.5-flash-lite',
+    'gemini-flash-lite-latest',
     'gemini-3.8-flash',
-    'gemini-2.5-flash',
-    'gemini-2.5-pro',
-    'gemini-1.5-flash',
   ]);
   const claudeList = parseEnvModelList(process.env.FACTORY_MODELS_CLAUDE, [
     'claude-3-7-sonnet-20250219',
@@ -135,227 +152,7 @@ app.get('/api/ai/models', (_req: Request, res: Response) => {
 });
 
 
-// ============================================================================
-// Multi-Provider AI Calling Engine (Claude, OpenAI, Copilot/Azure, Gemini)
-// ============================================================================
-
-interface AICallParams {
-  provider: 'claude' | 'openai' | 'copilot' | 'gemini';
-  model: string;
-  systemInstruction: string;
-  promptContent: string;
-  keys?: {
-    anthropicApiKey?: string;
-    openAiApiKey?: string;
-    azureApiKey?: string;
-    azureEndpoint?: string;
-    azureDeploymentName?: string;
-    azureApiVersion?: string;
-    geminiApiKey?: string;
-  };
-}
-
-// Normalizes an error thrown by any AI provider into { provider, model, status, message }
-function describeAiError(err: any, provider: string, model?: string): {
-  provider: string;
-  model: string;
-  status: number | null;
-  message: string;
-} {
-  let message: string = String(err?.message || err || 'Error desconocido del proveedor de IA.');
-  let status: number | null = typeof err?.status === 'number' ? err.status : typeof err?.code === 'number' ? err.code : null;
-
-  // Claude / OpenAI / Azure errors are thrown as "Proveedor (STATUS): detalle"
-  if (status === null) {
-    const m = message.match(/\((\d{3})\)/);
-    if (m) status = parseInt(m[1], 10);
-  }
-
-  // Gemini SDK embeds a JSON payload in the message: {"error":{"code":503,"message":"...","status":"UNAVAILABLE"}}
-  const jsonStart = message.indexOf('{');
-  if (jsonStart >= 0) {
-    try {
-      const parsed = JSON.parse(message.slice(jsonStart));
-      const inner = parsed?.error || parsed;
-      if (inner?.message) message = String(inner.message);
-      if (status === null && typeof inner?.code === 'number') status = inner.code;
-    } catch { }
-  }
-
-  if (err instanceof SyntaxError) {
-    message = 'El modelo devolvió una respuesta que no es un JSON válido. Inténtalo de nuevo.';
-  }
-
-  return { provider, model: model || 'default', status, message };
-}
-
-function parseLlmJsonResponse(raw: string): any {
-  let cleaned = raw.trim();
-  if (cleaned.startsWith('```')) {
-    cleaned = cleaned.replace(/^```(?:json)?\s*/i, '').replace(/```\s*$/, '').trim();
-  }
-  const startIdx = cleaned.indexOf('{');
-  const endIdx = cleaned.lastIndexOf('}');
-  if (startIdx >= 0 && endIdx > startIdx) {
-    cleaned = cleaned.slice(startIdx, endIdx + 1);
-  }
-  return JSON.parse(cleaned);
-}
-
-async function callAIProvider(params: AICallParams): Promise<string> {
-  const { provider, model, systemInstruction, promptContent, keys } = params;
-
-  // 1. ANTHROPIC CLAUDE
-  if (provider === 'claude') {
-    const apiKey = keys?.anthropicApiKey?.trim() || process.env.ANTHROPIC_API_KEY?.trim();
-    if (!apiKey) {
-      throw new Error('API Key de Anthropic Claude no configurada. Ingrésala en Ajustes o en el archivo .env (ANTHROPIC_API_KEY).');
-    }
-
-    const targetModel = model?.trim() || 'claude-3-7-sonnet-20250219';
-    const response = await fetch('https://api.anthropic.com/v1/messages', {
-      method: 'POST',
-      headers: {
-        'x-api-key': apiKey,
-        'anthropic-version': '2023-06-01',
-        'Content-Type': 'application/json',
-      },
-      body: JSON.stringify({
-        model: targetModel,
-        max_tokens: 4096,
-        system: systemInstruction,
-        messages: [
-          {
-            role: 'user',
-            content: `${promptContent}\n\nIMPORTANTE: Responde ÚNICAMENTE con el objeto JSON válido que cumple exactamente el esquema, sin texto previo ni posterior, sin comillas triples markdown.`,
-          },
-        ],
-      }),
-    });
-
-    if (!response.ok) {
-      const errText = await response.text();
-      let parsedErr = errText;
-      try {
-        const jsonErr = JSON.parse(errText);
-        parsedErr = jsonErr.error?.message || errText;
-      } catch { }
-      throw new Error(`Anthropic Claude (${response.status}): ${parsedErr}`);
-    }
-
-    const data = (await response.json()) as any;
-    return data.content?.[0]?.text || '{}';
-  }
-
-  // 2. OPENAI
-  if (provider === 'openai') {
-    const apiKey = keys?.openAiApiKey?.trim() || process.env.OPENAI_API_KEY?.trim();
-    if (!apiKey) {
-      throw new Error('API Key de OpenAI no configurada. Ingrésala en Ajustes o en el archivo .env (OPENAI_API_KEY).');
-    }
-
-    const targetModel = model?.trim() || 'gpt-4o';
-    const response = await fetch('https://api.openai.com/v1/chat/completions', {
-      method: 'POST',
-      headers: {
-        Authorization: `Bearer ${apiKey}`,
-        'Content-Type': 'application/json',
-      },
-      body: JSON.stringify({
-        model: targetModel,
-        response_format: { type: 'json_object' },
-        messages: [
-          { role: 'system', content: systemInstruction },
-          { role: 'user', content: promptContent },
-        ],
-        temperature: 0.2,
-      }),
-    });
-
-    if (!response.ok) {
-      const errText = await response.text();
-      let parsedErr = errText;
-      try {
-        const jsonErr = JSON.parse(errText);
-        parsedErr = jsonErr.error?.message || errText;
-      } catch { }
-      throw new Error(`OpenAI (${response.status}): ${parsedErr}`);
-    }
-
-    const data = (await response.json()) as any;
-    return data.choices?.[0]?.message?.content || '{}';
-  }
-
-  // 3. MICROSOFT COPILOT / AZURE OPENAI
-  if (provider === 'copilot') {
-    const apiKey = keys?.azureApiKey?.trim() || process.env.AZURE_OPENAI_KEY?.trim() || process.env.COPILOT_API_KEY?.trim();
-    const rawEndpoint = keys?.azureEndpoint?.trim() || process.env.AZURE_OPENAI_ENDPOINT?.trim();
-    const deployment = keys?.azureDeploymentName?.trim() || process.env.AZURE_OPENAI_DEPLOYMENT?.trim() || (model.includes('mini') ? 'gpt-4o-mini' : 'gpt-4o');
-    const apiVersion = keys?.azureApiVersion?.trim() || process.env.AZURE_OPENAI_API_VERSION?.trim() || '2024-08-01-preview';
-
-    if (!apiKey || !rawEndpoint) {
-      throw new Error('Se requiere Endpoint y API Key de Azure OpenAI / Microsoft Copilot. Configúralos en Ajustes o en el archivo .env.');
-    }
-
-    const endpoint = rawEndpoint.replace(/\/$/, '');
-    const url = `${endpoint}/openai/deployments/${deployment}/chat/completions?api-version=${apiVersion}`;
-
-    const response = await fetch(url, {
-      method: 'POST',
-      headers: {
-        'api-key': apiKey,
-        'Content-Type': 'application/json',
-      },
-      body: JSON.stringify({
-        response_format: { type: 'json_object' },
-        messages: [
-          { role: 'system', content: systemInstruction },
-          { role: 'user', content: promptContent },
-        ],
-        temperature: 0.2,
-      }),
-    });
-
-    if (!response.ok) {
-      const errText = await response.text();
-      let parsedErr = errText;
-      try {
-        const jsonErr = JSON.parse(errText);
-        parsedErr = jsonErr.error?.message || errText;
-      } catch { }
-      throw new Error(`Microsoft Copilot / Azure (${response.status}): ${parsedErr}`);
-    }
-
-    const data = (await response.json()) as any;
-    return data.choices?.[0]?.message?.content || '{}';
-  }
-
-  // 4. GOOGLE GEMINI
-  const geminiKey = keys?.geminiApiKey?.trim() || process.env.GEMINI_API_KEY?.trim();
-  if (!geminiKey) {
-    throw new Error('API Key de Google Gemini no configurada.');
-  }
-
-  const geminiInstance = new GoogleGenAI({
-    apiKey: geminiKey,
-    httpOptions: {
-      headers: {
-        'User-Agent': 'aistudio-build',
-      },
-    },
-  });
-
-  const targetModel = model?.trim() || 'gemini-3.8-flash';
-  const response = await geminiInstance.models.generateContent({
-    model: targetModel,
-    contents: `${systemInstruction}\n\n${promptContent}\n\nResponde ÚNICAMENTE con el objeto JSON válido.`,
-    config: {
-      responseMimeType: 'application/json',
-    },
-  });
-
-  return response.text?.trim() || '{}';
-}
+// (Multi-Provider AI Calling Engine & Error Handlers modularized in ./server/services/aiProviders)
 
 // Endpoint: Test connection for any AI Provider & Model
 app.post('/api/ai/test-connection', async (req: Request, res: Response) => {
@@ -406,34 +203,7 @@ app.post('/api/ai/test-connection', async (req: Request, res: Response) => {
 // Sanitization & Fallback Engine
 // ============================================================================
 
-// Terms and topic concepts that must NEVER be parsed as a human participant/assignee
-const NON_PERSON_KEYWORDS = [
-  'business dims', 'business dim', 'business', 'dim', 'dims',
-  'dag', 'dags', 'etl', 'crm', 'crmv2', 'atribución', 'atribucion',
-  'pipeline', 'pipelines', 'api', 'apis', 'backend', 'frontend',
-  'arquitectura', 'devops', 'cloud', 'database', 'base de datos', 'bd',
-  'análisis', 'analisis', 'riesgo', 'riesgos', 'objetivo', 'objetivos',
-  'tema', 'temas', 'conclusión', 'conclusion', 'acuerdo', 'acuerdos',
-  'resumen', 'minuta', 'nota', 'notas', 'pendiente', 'pendientes',
-  'discusión', 'discusion', 'sesión', 'sesion', 'reunión', 'reunion',
-  'daily', 'sprint', 'planning', 'criterio', 'criterios', 'propuesta',
-  'propuestas', 'documento', 'equipo', 'asistentes', 'participantes', 'contexto'
-];
-
-function isNonPersonName(name: string): boolean {
-  if (!name) return true;
-  const clean = name.toLowerCase().trim().replace(/^[#\-*\d\.\s:]+/, '').replace(/[:\-_]+$/, '');
-  if (clean.length < 2) return true;
-  for (const kw of NON_PERSON_KEYWORDS) {
-    if (clean === kw || clean.startsWith(kw + ' ') || clean.endsWith(' ' + kw)) {
-      return true;
-    }
-  }
-  if (/\b(dag|dags|dim|dims|business dims|crm|crmv2|etl|api|pipeline|backend|frontend|arquitectura)\b/i.test(clean)) {
-    return true;
-  }
-  return false;
-}
+// (Non-person keywords & isNonPersonName helper modularized in ./server/services/aiProviders)
 
 // Helper for dynamic NLP analysis when an AI API is unavailable or has depleted credits
 function getLocalFallbackAnalysis(
@@ -735,217 +505,82 @@ Se identificaron ${actionItems.length} compromisos directos traducidos en tareas
   };
 }
 
-interface BoardIssueContext {
-  key: string;
-  summary: string;
-  status: string;
-  statusCategory: string;
-  assignee: string;
-  isClosed: boolean;
-  score?: number;
-}
+// (BoardIssueContext and fetchBoardContext modularized in ./server/services/jiraCloud)
 
-// Helper: Fetch real or simulated Jira Board issues and score them by lexical relevance to transcript
-async function fetchBoardContext(
-  jiraConfig: any,
-  transcriptSnippet: string
-): Promise<BoardIssueContext[]> {
-  const isSimulation = jiraConfig?.simulationMode !== false;
-  const projectKey = (jiraConfig?.projectKey || 'PAY').trim().toUpperCase();
+// (fetchBoardContext is modularized and imported from ./server/services/jiraCloud)
 
-  let candidateIssues: BoardIssueContext[] = [];
-
-  if (!isSimulation && jiraConfig?.domain && jiraConfig?.userEmail && jiraConfig?.apiToken) {
-    try {
-      const cleanDomain = jiraConfig.domain.trim().replace(/^https?:\/\//, '').replace(/\/$/, '');
-      const authHeader = 'Basic ' + Buffer.from(`${jiraConfig.userEmail.trim()}:${jiraConfig.apiToken.trim()}`).toString('base64');
-
-      const jqlParts: string[] = [`project = "${projectKey}"`];
-
-      // Exclude issue types (default Epic)
-      const excludeTypes: string[] = Array.isArray(jiraConfig.excludeIssueTypes) && jiraConfig.excludeIssueTypes.length > 0
-        ? jiraConfig.excludeIssueTypes
-        : ['Epic'];
-      if (excludeTypes.length > 0) {
-        jqlParts.push(`issuetype NOT IN (${excludeTypes.map((t) => `"${t}"`).join(', ')})`);
-      }
-
-      // Recent closed days or active only
-      const recentDays = typeof jiraConfig.recentClosedDays === 'number' ? jiraConfig.recentClosedDays : 14;
-      if (recentDays > 0) {
-        jqlParts.push(`(statusCategory != Done OR (statusCategory = Done AND resolved >= -${recentDays}d))`);
-      } else {
-        jqlParts.push('statusCategory != Done');
-      }
-
-      // Backlog filter (if disabled, only issues in open sprint)
-      if (jiraConfig.includeBacklog === false) {
-        jqlParts.push('(sprint in openSprints() OR sprint is not EMPTY)');
-      }
-
-      // Filter labels / components if configured
-      if (jiraConfig.filterLabelsOrComponents && typeof jiraConfig.filterLabelsOrComponents === 'string' && jiraConfig.filterLabelsOrComponents.trim()) {
-        const terms = jiraConfig.filterLabelsOrComponents.split(',').map((t: string) => t.trim()).filter(Boolean);
-        if (terms.length > 0) {
-          jqlParts.push(`(labels IN (${terms.map((t: string) => `"${t}"`).join(', ')}) OR component IN (${terms.map((t: string) => `"${t}"`).join(', ')}))`);
-        }
-      }
-
-      // Custom JQL if configured
-      if (jiraConfig.customJql && typeof jiraConfig.customJql === 'string' && jiraConfig.customJql.trim()) {
-        jqlParts.push(`(${jiraConfig.customJql.trim()})`);
-      }
-
-      const finalJql = jqlParts.join(' AND ') + ' ORDER BY updated DESC';
-      const maxToFetch = Math.min(100, Math.max(20, jiraConfig.maxBoardTicketsForAI || 150));
-
-      // Atlassian CHANGE-2046 permanently sunsetted /rest/api/3/search with HTTP 410 Gone.
-      // Must use /rest/api/3/search/jql (POST or GET).
-      let jiraRes = await fetch(
-        `https://${cleanDomain}/rest/api/3/search/jql`,
-        {
-          method: 'POST',
-          headers: {
-            'Authorization': authHeader,
-            'Accept': 'application/json',
-            'Content-Type': 'application/json',
-          },
-          body: JSON.stringify({
-            jql: finalJql,
-            maxResults: maxToFetch,
-            fields: ['summary', 'status', 'assignee', 'priority', 'labels', 'updated'],
-          }),
-        }
-      );
-
-      // If POST is not supported or fails, try GET /rest/api/3/search/jql as fallback
-      if (!jiraRes.ok && jiraRes.status === 405) {
-        jiraRes = await fetch(
-          `https://${cleanDomain}/rest/api/3/search/jql?jql=${encodeURIComponent(finalJql)}&maxResults=${maxToFetch}&fields=summary,status,assignee,priority,labels,updated`,
-          {
-            headers: {
-              'Authorization': authHeader,
-              'Accept': 'application/json',
-            },
-          }
-        );
-      }
-
-      if (jiraRes.ok) {
-        const data = (await jiraRes.json()) as any;
-        if (Array.isArray(data.issues)) {
-          candidateIssues = data.issues.map((i: any) => {
-            const catKey = i.fields?.status?.statusCategory?.key;
-            const isClosed = catKey === 'done';
-            return {
-              key: i.key,
-              summary: i.fields?.summary || '',
-              status: i.fields?.status?.name || (isClosed ? 'Done' : 'In Progress'),
-              statusCategory: isClosed ? 'Done' : catKey === 'new' ? 'To Do' : 'In Progress',
-              assignee: i.fields?.assignee?.displayName || 'Sin asignar',
-              isClosed,
-            };
-          });
-          console.log(`[Jira Board Context] Successfully fetched ${candidateIssues.length} active board issues from Jira Cloud.`);
-        }
-      } else {
-        const errText = await jiraRes.text().catch(() => '');
-        console.warn(`[Jira Board Context] Query returned status ${jiraRes.status}: ${errText}`);
-      }
-    } catch (err) {
-      console.warn('[Jira Board Context] Error fetching board context from Jira Cloud:', err);
-    }
-  }
-
-  // Fallback to realistic simulated pool if in simulation mode or Jira returned empty
-  if (candidateIssues.length === 0) {
-    candidateIssues = [
-      {
-        key: `${projectKey}-101`,
-        summary: 'Migración y unificación de DAGs de Airflow para Atribución',
-        status: 'In Progress',
-        statusCategory: 'In Progress',
-        assignee: 'Carlos Mendoza',
-        isClosed: false,
-      },
-      {
-        key: `${projectKey}-102`,
-        summary: 'Implementación de Data Contracts en BigQuery para Marketing CRMV2',
-        status: 'In Progress',
-        statusCategory: 'In Progress',
-        assignee: 'Ana Sofía Rivas',
-        isClosed: false,
-      },
-      {
-        key: `${projectKey}-103`,
-        summary: 'Auditoría de logs de ingesta y validaciones de datos en Looker',
-        status: 'To Do',
-        statusCategory: 'To Do',
-        assignee: 'Rodrigo Alarcón',
-        isClosed: false,
-      },
-      {
-        key: `${projectKey}-104`,
-        summary: 'Refactorización del pipeline de Segment Calls y Genesys',
-        status: 'In Review',
-        statusCategory: 'In Progress',
-        assignee: 'Laura Cárdenas',
-        isClosed: false,
-      },
-      {
-        key: `${projectKey}-105`,
-        summary: 'Configuración de Data Quality Checks para tablas GA4',
-        status: 'Done',
-        statusCategory: 'Done',
-        assignee: 'Javier Domínguez',
-        isClosed: true,
-      },
-      {
-        key: `${projectKey}-106`,
-        summary: 'Integración de webhook de telefonía Byside y Convertia',
-        status: 'Done',
-        statusCategory: 'Done',
-        assignee: 'Ana Sofía Rivas',
-        isClosed: true,
-      },
-    ];
-  }
-
-  // Preselección y puntuación léxica de relevancia con respecto a la transcripción
-  const cleanTranscript = (transcriptSnippet || '')
+function normalizeCategoryText(text: string): string {
+  return (text || '')
     .toLowerCase()
     .normalize('NFD')
-    .replace(/[\u0300-\u036f]/g, '');
+    .replace(/[\u0300-\u036f]/g, '')
+    .replace(/&/g, ' y ')
+    .replace(/\s+de\s+/g, ' y ')
+    .replace(/[^a-z0-9]/g, ' ')
+    .replace(/\s+/g, ' ')
+    .trim();
+}
 
-  const scored = candidateIssues.map((issue) => {
+function matchClosestCategory(rawCategory: string, availableCategories: string[]): string {
+  if (!availableCategories || availableCategories.length === 0) return rawCategory || 'General';
+  const cleanRaw = (rawCategory || '').trim();
+  if (!cleanRaw) return availableCategories[0];
+
+  const exact = availableCategories.find((c) => c.toLowerCase() === cleanRaw.toLowerCase());
+  if (exact) return exact;
+
+  const normRaw = normalizeCategoryText(cleanRaw);
+  const normalizedMatch = availableCategories.find((c) => normalizeCategoryText(c) === normRaw);
+  if (normalizedMatch) return normalizedMatch;
+
+  const rawWords = normRaw.split(' ').filter((w) => w.length > 2);
+  let bestCategory = '';
+  let bestScore = 0;
+
+  for (const cat of availableCategories) {
+    const normCat = normalizeCategoryText(cat);
     let score = 0;
-    const cleanSummary = (issue.summary || '')
-      .toLowerCase()
-      .normalize('NFD')
-      .replace(/[\u0300-\u036f]/g, '');
-
-    const words = cleanSummary.split(/\s+/).filter((w) => w.length > 3);
-    for (const word of words) {
-      if (cleanTranscript.includes(word)) {
-        score += 3;
-      }
+    if (normCat.includes(normRaw) || normRaw.includes(normCat)) score += 6;
+    for (const rw of rawWords) {
+      if (normCat.includes(rw)) score += 3;
     }
+    if (normRaw.includes('arquitectura') && normCat.includes('arquitectura')) score += 10;
+    if (
+      (normRaw.includes('infraestructura') || normRaw.includes('pipeline') || normRaw.includes('cloud') || normRaw.includes('devops')) &&
+      (normCat.includes('devops') || normCat.includes('cloud'))
+    ) score += 10;
+    if (
+      (normRaw.includes('calidad') || normRaw.includes('qa') || normRaw.includes('test') || normRaw.includes('validacion')) &&
+      normCat.includes('qa')
+    ) score += 10;
+    if (
+      (normRaw.includes('reingenieria') || normRaw.includes('refactor') || normRaw.includes('migracion')) &&
+      normCat.includes('reingenieria')
+    ) score += 10;
+    if (
+      (normRaw.includes('ia') || normRaw.includes('inteligencia') || normRaw.includes('ml')) &&
+      normCat.includes('ia')
+    ) score += 10;
+    if (
+      (normRaw.includes('backend') || normRaw.includes('api') || normRaw.includes('servicio')) &&
+      normCat.includes('backend')
+    ) score += 10;
+    if (
+      (normRaw.includes('frontend') || normRaw.includes('ui') || normRaw.includes('ux') || normRaw.includes('interfaz')) &&
+      normCat.includes('frontend')
+    ) score += 10;
 
-    if (issue.key && cleanTranscript.includes(issue.key.toLowerCase())) {
-      score += 15;
+    if (score > bestScore) {
+      bestScore = score;
+      bestCategory = cat;
     }
+  }
 
-    if (issue.statusCategory === 'In Progress') {
-      score += 2;
-    }
+  if (bestScore >= 3 && bestCategory) {
+    return bestCategory;
+  }
 
-    return { ...issue, score };
-  });
-
-  scored.sort((a, b) => (b.score || 0) - (a.score || 0));
-
-  const maxReturn = Math.min(30, jiraConfig?.maxBoardTicketsForAI || 150);
-  return scored.slice(0, maxReturn);
+  return availableCategories[0];
 }
 
 // Endpoint: Analyze Teams Meeting Transcript with Existing Board Context
@@ -964,6 +599,7 @@ app.post('/api/analyze-transcript', async (req: Request, res: Response) => {
       jiraUsers = [],
       jiraConfig = {},
       existingTopics = [],
+      topicCategories = [],
     } = req.body;
 
     if (!transcript || typeof transcript !== 'string' || transcript.trim().length === 0) {
@@ -987,6 +623,19 @@ app.post('/api/analyze-transcript', async (req: Request, res: Response) => {
     } else {
       promptInstructions = `ENFOQUE ESTÁNDAR ÁGIL (JIRA-READY): Desglosa la transcripción en tareas altamente accionables, historias de usuario, spikes y bugs técnicos listos para Jira. Cada ítem DEBE identificar con absoluta precisión al participante del equipo que asume la responsabilidad (assignee), sus criterios de aceptación (acceptance criteria) y su contexto técnico.`;
     }
+
+    const effectiveCategories = Array.isArray(topicCategories) && topicCategories.length > 0
+      ? topicCategories
+      : [
+          'Backend & APIs',
+          'DevOps & Cloud',
+          'Arquitectura & Datos',
+          'Seguridad & Compliance',
+          'QA & Automatización',
+          'Gestión & Producto',
+          'Reingenieria',
+          'IA'
+        ];
 
     const systemInstruction = `Eres un Principal Technical Project Manager y Agile Coach experto en análisis de transcripciones de Microsoft Teams y gestión de proyectos en Jira Cloud.
 Tu objetivo es analizar la transcripción de la reunión, comprender quién participó, qué temas se trataron, detectar con precisión si se habló de tareas que ya existen en el tablero de Jira o si son tareas nuevas.
@@ -1048,7 +697,27 @@ REGLAS CRÍTICAS DE CALIDAD Y ASIGNACIÓN (OBLIGATORIAS):
    - Cada título de tarea nueva debe comenzar con un verbo en infinitivo (ej: 'Concentrar integración de...', 'Implementar...', 'Refactorizar...').
    - Cada ticket nuevo debe incluir criterios de aceptación comprobables y story points razonables (1, 2, 3, 5, 8).
 
-7. FORMATO:
+7. COMPROMISOS HUÉRFANOS ('orphanCommitments'):
+   - Identifica compromisos, acuerdos o tareas que se mencionaron en la reunión pero que quedaron sin un responsable explícito o inequívoco (ej: 'habría que revisar los logs', 'después preparamos el reporte').
+   - Para cada uno, define un título conciso, el contexto hablado, el tema y sugiere la persona más adecuada del equipo ('suggestedAssignee') según su rol o contexto. Si no hay compromisos huérfanos, devuelve un array vacío [].
+
+8. DEPENDENCIAS Y BLOQUEOS ('dependencies'):
+   - Si la tarea de un participante bloquea o es prerrequisito para que otro participante pueda comenzar o finalizar la suya (ej: 'hasta que Juan no suba la macro, María no puede probar el modelo'), extrae la dependencia vinculándola con los IDs de las tareas ('blockerTaskId' y 'blockedTaskId' correspondientes a 'actionItems').
+   - Si no se identifican dependencias de bloqueo mutuo en la sesión, devuelve un array vacío [].
+
+9. MATRIZ RACI ('raciMatrix'):
+   - Para los temas o entregables principales de la reunión, genera filas RACI asignando:
+     * 'responsible': quién realiza operativamente el trabajo.
+     * 'accountable': quién aprueba o responde por el entregable ante el negocio/cliente.
+     * 'consulted': array de nombres de participantes a quienes se consulta soporte técnico o diseño.
+     * 'informed': array de nombres de participantes que deben mantenerse al tanto del avance.
+
+10. CATEGORÍAS DE TEMAS OBLIGATORIAS:
+   - El campo 'category' de cada tema en 'mainTopics' y en 'raciMatrix' DEBE pertenecer RIGUROSAMENTE a una de las siguientes categorías configuradas en el proyecto:
+${effectiveCategories.map((c: string) => `     * "${c}"`).join('\n')}
+   - ESTÁ TERMINANTEMENTE PROHIBIDO inventar categorías libres o sinónimos fuera de esa lista (ej: usa siempre "Arquitectura & Datos", NUNCA inventes "General", "Calidad de Datos", "Infraestructura y Pipelines" o "Arquitectura de Datos").
+
+11. FORMATO:
    - Responde SIEMPRE en español en un formato JSON estrictamente válido que cumpla con el siguiente esquema:
    {
      "meetingTitle": "string",
@@ -1091,6 +760,40 @@ REGLAS CRÍTICAS DE CALIDAD Y ASIGNACIÓN (OBLIGATORIAS):
          "acceptanceCriteria": ["string"],
          "jiraLabels": ["string"]
        }
+     ],
+     "orphanCommitments": [
+       {
+         "id": "orph-1",
+         "title": "string",
+         "context": "string",
+         "topicName": "string",
+         "suggestedAssignee": "string (HUMANO)",
+         "priority": "Highest|High|Medium|Low"
+       }
+     ],
+     "dependencies": [
+       {
+         "id": "dep-1",
+         "blockerTaskId": "act-1",
+         "blockerTitle": "string",
+         "blockerAssignee": "string (HUMANO)",
+         "blockedTaskId": "act-2",
+         "blockedTitle": "string",
+         "blockedAssignee": "string (HUMANO)",
+         "description": "string"
+       }
+     ],
+     "raciMatrix": [
+       {
+         "id": "raci-1",
+         "topicOrDeliverable": "string",
+         "responsible": "string (HUMANO)",
+         "accountable": "string (HUMANO)",
+         "consulted": ["string"],
+         "informed": ["string"],
+         "category": "string",
+         "status": "string"
+       }
      ]
    }`;
 
@@ -1110,12 +813,15 @@ ${JSON.stringify(boardTickets.map((t) => ({ key: t.key, summary: t.summary, stat
 TEMAS PREVIOS EN EL HISTÓRICO DEL PROYECTO (${existingTopics.length} temas registrados):
 ${JSON.stringify((existingTopics || []).slice(0, 30).map((t: any) => ({ id: t.id, topicName: t.topicName, category: t.category, associatedJiraKeys: t.associatedJiraKeys, leadParticipant: t.leadParticipant, status: t.status })), null, 2)}
 
+CATEGORÍAS DE SEGUIMIENTO CONFIGURADAS EN EL PROYECTO (OBLIGATORIAS):
+${effectiveCategories.join(', ')}
+
 TRANSCRIPCIÓN O APUNTES DE LA REUNIÓN EN TEAMS:
 """
 ${transcript.slice(0, 30000)}
 """
 
-Extrae el resumen ejecutivo, acuerdos, temas (unificando con tickets/temas previos si corresponde), participantes y los action items clasificados.`;
+Extrae el resumen ejecutivo, acuerdos, temas (unificando con tickets/temas previos si corresponde), participantes, action items clasificados, compromisos huérfanos ('orphanCommitments'), dependencias ('dependencies') y matriz RACI ('raciMatrix').`;
 
     try {
       const rawResponse = await callAIProvider({
@@ -1206,6 +912,7 @@ Extrae el resumen ejecutivo, acuerdos, temas (unificando con tickets/temas previ
           if (!top.id) top.id = `top-${idx + 1}`;
           if (!top.status) top.status = 'En Progreso';
           if (!top.riskLevel) top.riskLevel = 'Medio';
+          top.category = matchClosestCategory(top.category, effectiveCategories);
 
           // Validate matchedJiraKey against real board keys
           if (top.matchedJiraKey) {
@@ -1246,6 +953,76 @@ Extrae el resumen ejecutivo, acuerdos, temas (unificando con tickets/temas previ
             top.proposedProgressNote = top.discussionSummary || 'Seguimiento y revisión del estado de la tarea en reunión.';
           }
         });
+      }
+
+      // Post-process sanitation for orphanCommitments
+      if (!Array.isArray(parsed.orphanCommitments)) {
+        parsed.orphanCommitments = [];
+      } else {
+        parsed.orphanCommitments = parsed.orphanCommitments
+          .filter((o: any) => o && typeof o.title === 'string' && o.title.trim().length > 0)
+          .map((o: any, idx: number) => {
+            const fallbackAssignee =
+              parsed.participants?.find((p: any) => !isNonPersonName(p.name))?.name ||
+              jiraUsers?.[0]?.displayName ||
+              'Equipo';
+            return {
+              id: o.id || `orph-${idx + 1}`,
+              title: String(o.title || '').trim(),
+              context: String(o.context || o.title || '').trim(),
+              topicName: String(o.topicName || parsed.mainTopics?.[0]?.topicName || 'General').trim(),
+              suggestedAssignee: isNonPersonName(o.suggestedAssignee)
+                ? fallbackAssignee
+                : o.suggestedAssignee || fallbackAssignee,
+              priority: ['Highest', 'High', 'Medium', 'Low'].includes(o.priority) ? o.priority : 'High',
+            };
+          });
+      }
+
+      // Post-process sanitation for dependencies
+      if (!Array.isArray(parsed.dependencies)) {
+        parsed.dependencies = [];
+      } else {
+        parsed.dependencies = parsed.dependencies
+          .filter((d: any) => d && (d.blockerTitle || d.blockedTitle || d.description))
+          .map((d: any, idx: number) => {
+            const fallbackP1 = parsed.participants?.[0]?.name || 'Equipo';
+            const fallbackP2 = parsed.participants?.[1]?.name || fallbackP1;
+            return {
+              id: d.id || `dep-${idx + 1}`,
+              blockerTaskId: String(d.blockerTaskId || `act-${idx + 1}`),
+              blockerTitle: String(d.blockerTitle || 'Tarea bloqueante').trim(),
+              blockerAssignee: isNonPersonName(d.blockerAssignee) ? fallbackP1 : d.blockerAssignee || fallbackP1,
+              blockedTaskId: String(d.blockedTaskId || `act-${idx + 2}`),
+              blockedTitle: String(d.blockedTitle || 'Tarea bloqueada').trim(),
+              blockedAssignee: isNonPersonName(d.blockedAssignee) ? fallbackP2 : d.blockedAssignee || fallbackP2,
+              description: String(d.description || 'Precedencia técnica identificada en la sesión.').trim(),
+            };
+          });
+      }
+
+      // Post-process sanitation for raciMatrix
+      if (!Array.isArray(parsed.raciMatrix)) {
+        parsed.raciMatrix = [];
+      } else {
+        parsed.raciMatrix = parsed.raciMatrix
+          .filter((r: any) => r && r.topicOrDeliverable)
+          .map((r: any, idx: number) => {
+            const fallbackLead =
+              parsed.participants?.find((p: any) => !isNonPersonName(p.name))?.name ||
+              jiraUsers?.[0]?.displayName ||
+              'Equipo';
+            return {
+              id: r.id || `raci-${idx + 1}`,
+              topicOrDeliverable: String(r.topicOrDeliverable || `Entregable ${idx + 1}`).trim(),
+              responsible: isNonPersonName(r.responsible) ? fallbackLead : r.responsible || fallbackLead,
+              accountable: isNonPersonName(r.accountable) ? fallbackLead : r.accountable || fallbackLead,
+              consulted: Array.isArray(r.consulted) ? r.consulted.filter((c: any) => !isNonPersonName(c)).map(String) : [],
+              informed: Array.isArray(r.informed) ? r.informed.filter((i: any) => !isNonPersonName(i)).map(String) : [],
+              category: matchClosestCategory(r.category || parsed.mainTopics?.[0]?.category, effectiveCategories),
+              status: String(r.status || 'En Progreso').trim(),
+            };
+          });
       }
 
       return res.json({
@@ -1293,111 +1070,7 @@ app.post('/api/jira/board-context', async (req: Request, res: Response) => {
   }
 });
 
-// Cache for Jira Issue Link Types per domain
-const jiraIssueLinkTypesCache = new Map<string, any[]>();
-
-// Helper: Create native Jira Issue Link between two tickets
-async function linkJiraIssuesInCloud(
-  domain: string,
-  authHeader: string,
-  newIssueKey: string,
-  sourceIssueKey: string,
-  relationType: 'relates' | 'is_blocked_by' | 'blocks' | 'cloners'
-): Promise<{ linked: boolean; linkTypeName?: string; warning?: string }> {
-  try {
-    let linkTypes = jiraIssueLinkTypesCache.get(domain);
-    if (!linkTypes) {
-      const typesRes = await fetch(`https://${domain}/rest/api/3/issueLinkType`, {
-        headers: { Authorization: authHeader, Accept: 'application/json' },
-      });
-      if (typesRes.ok) {
-        const typesData = (await typesRes.json()) as any;
-        const fetchedTypes: any[] = Array.isArray(typesData.issueLinkTypes) ? typesData.issueLinkTypes : [];
-        linkTypes = fetchedTypes;
-        jiraIssueLinkTypesCache.set(domain, fetchedTypes);
-      } else {
-        linkTypes = [];
-      }
-    }
-
-    // Match appropriate link type in English or Spanish instances
-    let chosenTypeName = 'Relates';
-    if (linkTypes && linkTypes.length > 0) {
-      const findType = (patterns: RegExp[]) =>
-        linkTypes!.find((lt: any) =>
-          patterns.some(
-            (rx) =>
-              rx.test(String(lt.name || '')) ||
-              rx.test(String(lt.inward || '')) ||
-              rx.test(String(lt.outward || ''))
-          )
-        );
-
-      if (relationType === 'blocks' || relationType === 'is_blocked_by') {
-        const found = findType([/block/i, /bloque/i]);
-        if (found?.name) chosenTypeName = found.name;
-      } else if (relationType === 'cloners') {
-        const found = findType([/clon/i]);
-        if (found?.name) chosenTypeName = found.name;
-      } else {
-        const found = findType([/relat/i, /relacion/i]);
-        if (found?.name) chosenTypeName = found.name;
-      }
-    } else {
-      chosenTypeName =
-        relationType === 'blocks' || relationType === 'is_blocked_by'
-          ? 'Blocks'
-          : relationType === 'cloners'
-          ? 'Cloners'
-          : 'Relates';
-    }
-
-    // In Jira REST API v3 /rest/api/3/issueLink:
-    // For "Blocks" (outward="blocks", inward="is blocked by"):
-    // inwardIssue is the issue that HAS the outward relation ("blocks") toward outwardIssue ("is blocked by").
-    let inwardKey = sourceIssueKey;
-    let outwardKey = newIssueKey;
-
-    if (relationType === 'is_blocked_by') {
-      // newIssueKey is blocked by sourceIssueKey -> sourceIssueKey blocks newIssueKey
-      inwardKey = sourceIssueKey;
-      outwardKey = newIssueKey;
-    } else if (relationType === 'blocks') {
-      // newIssueKey blocks sourceIssueKey
-      inwardKey = newIssueKey;
-      outwardKey = sourceIssueKey;
-    } else if (relationType === 'cloners') {
-      // newIssueKey clones sourceIssueKey
-      inwardKey = newIssueKey;
-      outwardKey = sourceIssueKey;
-    }
-
-    const linkRes = await fetch(`https://${domain}/rest/api/3/issueLink`, {
-      method: 'POST',
-      headers: {
-        Authorization: authHeader,
-        'Content-Type': 'application/json',
-        Accept: 'application/json',
-      },
-      body: JSON.stringify({
-        type: { name: chosenTypeName },
-        inwardIssue: { key: inwardKey },
-        outwardIssue: { key: outwardKey },
-      }),
-    });
-
-    if (linkRes.ok) {
-      return { linked: true, linkTypeName: chosenTypeName };
-    } else {
-      const errTxt = await linkRes.text().catch(() => '');
-      console.warn(`[Jira IssueLink] Could not link ${newIssueKey} <-> ${sourceIssueKey} (${linkRes.status}):`, errTxt);
-      return { linked: false, warning: `No se pudo vincular con ${sourceIssueKey} (${linkRes.status})` };
-    }
-  } catch (err: any) {
-    console.warn('[Jira IssueLink] Error linking issues:', err);
-    return { linked: false, warning: err?.message };
-  }
-}
+// (linkJiraIssuesInCloud modularized in ./server/services/jiraCloud)
 
 // Endpoint: Fetch Active Epics from Jira Project (Funcionalidad 4)
 app.post('/api/jira/epics', async (req: Request, res: Response) => {
@@ -1490,97 +1163,7 @@ app.post('/api/jira/epics', async (req: Request, res: Response) => {
   }
 });
 
-// Helper to build structured Atlassian Document Format (ADF) for comments with Acceptance Criteria
-const buildCommentAdf = (rawComment: string) => {
-  const lines = rawComment.split(/\r?\n/);
-  const contentNodes: any[] = [];
-  let inCriteriaList = false;
-  let criteriaItems: string[] = [];
-  let currentParagraphLines: string[] = [];
-
-  const flushParagraph = () => {
-    if (currentParagraphLines.length > 0) {
-      contentNodes.push({
-        type: 'paragraph',
-        content: [
-          {
-            type: 'text',
-            text: currentParagraphLines.join('\n'),
-          },
-        ],
-      });
-      currentParagraphLines = [];
-    }
-  };
-
-  const flushCriteriaList = () => {
-    if (criteriaItems.length > 0) {
-      contentNodes.push({
-        type: 'bulletList',
-        content: criteriaItems.map((itemText) => ({
-          type: 'listItem',
-          content: [
-            {
-              type: 'paragraph',
-              content: [{ type: 'text', text: itemText }],
-            },
-          ],
-        })),
-      });
-      criteriaItems = [];
-    }
-  };
-
-  for (const line of lines) {
-    const trimmed = line.trim();
-    if (!trimmed) {
-      flushParagraph();
-      continue;
-    }
-
-    if (/^criterios de aceptaci[oó]n/i.test(trimmed)) {
-      flushParagraph();
-      flushCriteriaList();
-      contentNodes.push({
-        type: 'paragraph',
-        content: [
-          {
-            type: 'text',
-            text: trimmed,
-            marks: [{ type: 'strong' }],
-          },
-        ],
-      });
-      inCriteriaList = true;
-      continue;
-    }
-
-    if (inCriteriaList) {
-      const cleanCriterion = trimmed.replace(/^[-*•\d+.\s]+/, '').trim() || trimmed;
-      criteriaItems.push(cleanCriterion);
-    } else {
-      currentParagraphLines.push(trimmed);
-    }
-  }
-
-  flushParagraph();
-  flushCriteriaList();
-
-  if (contentNodes.length === 0) {
-    contentNodes.push({
-      type: 'paragraph',
-      content: [{ type: 'text', text: rawComment }],
-    });
-  }
-
-  return {
-    body: {
-      type: 'doc',
-      version: 1,
-      content: contentNodes,
-    },
-  };
-};
+// (buildCommentAdf modularized in ./server/services/jiraAdf)
 
 // Endpoint: Add or Update Comment on an Existing Jira Issue
 app.post('/api/jira/add-comment', async (req: Request, res: Response) => {
@@ -1699,110 +1282,36 @@ app.post('/api/jira/update-issue', async (req: Request, res: Response) => {
       const domain = jiraConfig.domain.trim().replace(/^https?:\/\//, '').replace(/\/$/, '');
       const authHeader = 'Basic ' + Buffer.from(`${jiraConfig.userEmail.trim()}:${jiraConfig.apiToken.trim()}`).toString('base64');
 
-      // Discover Assignee accountId in Jira Cloud if assigned
-      let matchingAccountId: string | null = null;
+      // Discover Story Points field and Assignee accountId in Jira Cloud
+      const spFieldId = await discoverStoryPointsFieldId(domain, authHeader);
       const rawAssignee = (actionItem.assignee || '').trim();
       const cleanAssigneeName = rawAssignee.replace(/\s*\([^)]*\)/g, '').trim();
-
-      if (cleanAssigneeName && cleanAssigneeName.toLowerCase() !== 'sin asignar') {
-        const knownUsers: any[] = jiraUsers || jiraConfig?.jiraUsers || [];
-        const foundLocal = knownUsers.find((u: any) => {
-          const dn = (u.displayName || '').toLowerCase();
-          const em = (u.emailAddress || '').toLowerCase();
-          const query = cleanAssigneeName.toLowerCase();
-          return dn === query || dn.includes(query) || query.includes(dn) || em.startsWith(query);
-        });
-
-        if (foundLocal?.accountId && !foundLocal.accountId.startsWith('jira-usr-')) {
-          matchingAccountId = foundLocal.accountId;
-        } else {
-          try {
-            const projectKey = cleanKey.split('-')[0];
-            const userSearchRes = await fetch(
-              `https://${domain}/rest/api/3/user/assignable/search?project=${encodeURIComponent(projectKey)}&query=${encodeURIComponent(cleanAssigneeName)}`,
-              {
-                headers: {
-                  'Authorization': authHeader,
-                  'Accept': 'application/json',
-                },
-              }
-            );
-            if (userSearchRes.ok) {
-              const searchResults = (await userSearchRes.json()) as any[];
-              if (Array.isArray(searchResults) && searchResults.length > 0) {
-                const exact = searchResults.find((u: any) =>
-                  u.displayName?.toLowerCase().includes(cleanAssigneeName.toLowerCase()) ||
-                  cleanAssigneeName.toLowerCase().includes(u.displayName?.toLowerCase())
-                );
-                const selectedUser = exact || searchResults[0];
-                if (selectedUser?.accountId) {
-                  matchingAccountId = selectedUser.accountId;
-                }
-              }
-            }
-          } catch (userErr) {
-            console.warn('Error querying Jira assignable users for update:', userErr);
-          }
-        }
-      }
-
-      // Build ADF Description including updated criteria and technical context
-      const descContent: any[] = [];
-      const mainDesc = (actionItem.description || '').trim();
-      if (mainDesc) {
-        descContent.push({
-          type: 'paragraph',
-          content: [{ type: 'text', text: mainDesc }],
-        });
-      }
-
-      const techContext = (actionItem.technicalContext || '').trim();
-      if (techContext) {
-        descContent.push({
-          type: 'paragraph',
-          content: [{ type: 'text', text: `Contexto Reunión Teams:\n${techContext}` }],
-        });
-      }
-
-      const criteria = Array.isArray(actionItem.acceptanceCriteria)
-        ? actionItem.acceptanceCriteria.map((c: string) => String(c).trim()).filter(Boolean)
-        : [];
-
-      if (criteria.length > 0) {
-        descContent.push({
-          type: 'heading',
-          attrs: { level: 3 },
-          content: [{ type: 'text', text: 'Criterios de Aceptación' }],
-        });
-        descContent.push({
-          type: 'bulletList',
-          content: criteria.map((crit: string) => ({
-            type: 'listItem',
-            content: [{ type: 'paragraph', content: [{ type: 'text', text: crit }] }],
-          })),
-        });
-      }
-
-      if (descContent.length === 0) {
-        descContent.push({
-          type: 'paragraph',
-          content: [{ type: 'text', text: actionItem.title || 'Actualizado desde ProyectHandler' }],
-        });
-      }
+      const assigneeRes = await resolveJiraAssigneeAccountId(
+        domain,
+        authHeader,
+        cleanKey.split('-')[0],
+        cleanAssigneeName,
+        jiraUsers || jiraConfig?.jiraUsers || []
+      );
+      const matchingAccountId = assigneeRes?.accountId || null;
 
       const buildUpdatePayload = (
         withAssignee: boolean = true,
         withPriority: boolean = true,
-        withParent: boolean = true
+        withParent: boolean = true,
+        withStoryPoints: boolean = true
       ) => {
+        const descAdf = buildIssueDescriptionAdf(
+          actionItem.description,
+          actionItem.technicalContext,
+          actionItem.acceptanceCriteria,
+          actionItem.title || 'Actualizado desde ProyectHandler'
+        );
+
         const payload: any = {
           fields: {
             summary: (actionItem.title || '').trim(),
-            description: {
-              type: 'doc',
-              version: 1,
-              content: descContent,
-            },
+            description: descAdf,
             labels: actionItem.jiraLabels || [],
           },
         };
@@ -1819,6 +1328,15 @@ app.post('/api/jira/update-issue', async (req: Request, res: Response) => {
           payload.fields.parent = { key: String(actionItem.epicKey).trim().toUpperCase() };
         }
 
+        if (
+          withStoryPoints &&
+          spFieldId &&
+          typeof actionItem.storyPoints === 'number' &&
+          actionItem.storyPoints > 0
+        ) {
+          payload.fields[spFieldId] = Number(actionItem.storyPoints);
+        }
+
         return payload;
       };
 
@@ -1829,15 +1347,16 @@ app.post('/api/jira/update-issue', async (req: Request, res: Response) => {
           'Content-Type': 'application/json',
           'Accept': 'application/json',
         },
-        body: JSON.stringify(buildUpdatePayload(true, true, true)),
+        body: JSON.stringify(buildUpdatePayload(true, true, true, true)),
       });
 
-      // If rejected, check if due to parent, assignee or priority
+      // If rejected, check if due to story points, parent, assignee or priority
       if (!response.ok) {
         const errText = await response.text();
         console.warn(`[Jira Update Issue] Response ${response.status} on ${cleanKey}:`, errText);
 
-        if (errText.includes('parent') || errText.includes('hierarchy')) {
+        if (spFieldId && (errText.includes(spFieldId) || /story\s*point/i.test(errText))) {
+          console.warn(`[Jira Story Points] Could not set story points on ${cleanKey}, retrying without story points:`, errText);
           response = await fetch(`https://${domain}/rest/api/3/issue/${encodeURIComponent(cleanKey)}`, {
             method: 'PUT',
             headers: {
@@ -1845,7 +1364,17 @@ app.post('/api/jira/update-issue', async (req: Request, res: Response) => {
               'Content-Type': 'application/json',
               'Accept': 'application/json',
             },
-            body: JSON.stringify(buildUpdatePayload(true, true, false)),
+            body: JSON.stringify(buildUpdatePayload(true, true, true, false)),
+          });
+        } else if (errText.includes('parent') || errText.includes('hierarchy')) {
+          response = await fetch(`https://${domain}/rest/api/3/issue/${encodeURIComponent(cleanKey)}`, {
+            method: 'PUT',
+            headers: {
+              'Authorization': authHeader,
+              'Content-Type': 'application/json',
+              'Accept': 'application/json',
+            },
+            body: JSON.stringify(buildUpdatePayload(true, true, false, true)),
           });
         } else if (errText.includes('assignee')) {
           response = await fetch(`https://${domain}/rest/api/3/issue/${encodeURIComponent(cleanKey)}`, {
@@ -1855,7 +1384,7 @@ app.post('/api/jira/update-issue', async (req: Request, res: Response) => {
               'Content-Type': 'application/json',
               'Accept': 'application/json',
             },
-            body: JSON.stringify(buildUpdatePayload(false, true, false)),
+            body: JSON.stringify(buildUpdatePayload(false, true, false, true)),
           });
         } else if (errText.includes('priority')) {
           response = await fetch(`https://${domain}/rest/api/3/issue/${encodeURIComponent(cleanKey)}`, {
@@ -1865,7 +1394,7 @@ app.post('/api/jira/update-issue', async (req: Request, res: Response) => {
               'Content-Type': 'application/json',
               'Accept': 'application/json',
             },
-            body: JSON.stringify(buildUpdatePayload(true, false, false)),
+            body: JSON.stringify(buildUpdatePayload(true, false, false, true)),
           });
         }
 
@@ -2075,117 +1604,43 @@ app.post('/api/jira/create-issue', async (req: Request, res: Response) => {
           console.warn('Could not auto-detect project issue types:', metaErr);
         }
 
+        // Discover Story Points field
+        const spFieldId = await discoverStoryPointsFieldId(domain, authHeader);
+
         // Discover and match Assignee accountId in Jira Cloud
-        let matchingAccountId: string | null = null;
-        let matchedAssigneeName: string | null = null;
         const rawAssignee = (actionItem.assignee || '').trim();
         const cleanAssigneeName = rawAssignee.replace(/\s*\([^)]*\)/g, '').trim();
-
-        if (cleanAssigneeName) {
-          const knownUsers: any[] = req.body.jiraUsers || jiraConfig?.jiraUsers || [];
-          const foundLocal = knownUsers.find((u: any) => {
-            const dn = (u.displayName || '').toLowerCase();
-            const em = (u.emailAddress || '').toLowerCase();
-            const query = cleanAssigneeName.toLowerCase();
-            return dn === query || dn.includes(query) || query.includes(dn) || em.startsWith(query);
-          });
-
-          if (foundLocal?.accountId && !foundLocal.accountId.startsWith('jira-usr-')) {
-            matchingAccountId = foundLocal.accountId;
-            matchedAssigneeName = foundLocal.displayName;
-          } else {
-            // Query Jira Cloud for assignable users in this project
-            try {
-              const userSearchRes = await fetch(
-                `https://${domain}/rest/api/3/user/assignable/search?project=${projectKey}&query=${encodeURIComponent(cleanAssigneeName)}`,
-                {
-                  headers: {
-                    'Authorization': authHeader,
-                    'Accept': 'application/json',
-                  },
-                }
-              );
-              if (userSearchRes.ok) {
-                const searchResults = (await userSearchRes.json()) as any[];
-                if (Array.isArray(searchResults) && searchResults.length > 0) {
-                  const exact = searchResults.find((u: any) =>
-                    u.displayName?.toLowerCase().includes(cleanAssigneeName.toLowerCase()) ||
-                    cleanAssigneeName.toLowerCase().includes(u.displayName?.toLowerCase())
-                  );
-                  const selectedUser = exact || searchResults[0];
-                  if (selectedUser?.accountId) {
-                    matchingAccountId = selectedUser.accountId;
-                    matchedAssigneeName = selectedUser.displayName;
-                  }
-                }
-              }
-            } catch (userErr) {
-              console.warn('Error querying Jira assignable users:', userErr);
-            }
-          }
-        }
+        const assigneeRes = await resolveJiraAssigneeAccountId(
+          domain,
+          authHeader,
+          projectKey,
+          cleanAssigneeName,
+          req.body.jiraUsers || jiraConfig?.jiraUsers || []
+        );
+        const matchingAccountId = assigneeRes?.accountId || null;
 
         const buildJiraPayload = (
           typeName: string,
           withAssignee: boolean = true,
-          withParent: boolean = true
+          withParent: boolean = true,
+          withStoryPoints: boolean = true
         ) => {
-          const descContent: any[] = [];
-          const mainDesc = (actionItem.description || '').trim();
-          if (mainDesc) {
-            descContent.push({
-              type: 'paragraph',
-              content: [{ type: 'text', text: mainDesc }],
-            });
-          }
-
-          const techContext = (actionItem.technicalContext || '').trim();
-          if (techContext) {
-            descContent.push({
-              type: 'paragraph',
-              content: [{ type: 'text', text: `Contexto Reunión Teams:\n${techContext}` }],
-            });
-          }
-
-          const criteria = Array.isArray(actionItem.acceptanceCriteria)
-            ? actionItem.acceptanceCriteria.map((crit: string) => String(crit).trim()).filter(Boolean)
-            : [];
-
-          if (criteria.length > 0) {
-            descContent.push({
-              type: 'heading',
-              attrs: { level: 3 },
-              content: [{ type: 'text', text: 'Criterios de Aceptación' }],
-            });
-            descContent.push({
-              type: 'bulletList',
-              content: criteria.map((crit: string) => ({
-                type: 'listItem',
-                content: [{ type: 'paragraph', content: [{ type: 'text', text: crit }] }],
-              })),
-            });
-          }
-
-          if (descContent.length === 0) {
-            descContent.push({
-              type: 'paragraph',
-              content: [{ type: 'text', text: actionItem.title || 'Generado desde ProyectHandler' }],
-            });
-          }
+          const descAdf = buildIssueDescriptionAdf(
+            actionItem.description,
+            actionItem.technicalContext,
+            actionItem.acceptanceCriteria,
+            actionItem.title || 'Generado desde ProyectHandler'
+          );
 
           const payload: any = {
             fields: {
               project: { key: projectKey },
               summary: actionItem.title,
-              description: {
-                type: 'doc',
-                version: 1,
-                content: descContent,
-              },
+              description: descAdf,
               issuetype: { name: typeName },
               priority: { name: actionItem.priority || 'Medium' },
               labels: actionItem.jiraLabels || ['teams-meeting-ai'],
-            }
+            },
           };
 
           if (withAssignee && matchingAccountId) {
@@ -2194,6 +1649,15 @@ app.post('/api/jira/create-issue', async (req: Request, res: Response) => {
 
           if (withParent && actionItem.epicKey && String(actionItem.epicKey).trim()) {
             payload.fields.parent = { key: String(actionItem.epicKey).trim().toUpperCase() };
+          }
+
+          if (
+            withStoryPoints &&
+            spFieldId &&
+            typeof actionItem.storyPoints === 'number' &&
+            actionItem.storyPoints > 0
+          ) {
+            payload.fields[spFieldId] = Number(actionItem.storyPoints);
           }
 
           return payload;
@@ -2206,13 +1670,27 @@ app.post('/api/jira/create-issue', async (req: Request, res: Response) => {
             'Content-Type': 'application/json',
             'Accept': 'application/json'
           },
-          body: JSON.stringify(buildJiraPayload(resolvedIssueTypeName, true, true)),
+          body: JSON.stringify(buildJiraPayload(resolvedIssueTypeName, true, true, true)),
         });
 
-        // If rejected, check if issue was due to parent, assignee or issuetype
+        // If rejected, check if issue was due to story points, parent, assignee or issuetype
         if (!response.ok) {
           const errText = await response.text();
-          if (errText.includes('parent') || errText.includes('hierarchy')) {
+          if (spFieldId && (errText.includes(spFieldId) || /story\s*point/i.test(errText))) {
+            console.warn(`[Jira Story Points] Could not set story points on ${resolvedIssueTypeName}, retrying without story points:`, errText);
+            const retryWithoutSp = await fetch(`https://${domain}/rest/api/3/issue`, {
+              method: 'POST',
+              headers: {
+                'Authorization': authHeader,
+                'Content-Type': 'application/json',
+                'Accept': 'application/json'
+              },
+              body: JSON.stringify(buildJiraPayload(resolvedIssueTypeName, true, true, false)),
+            });
+            if (retryWithoutSp.ok) {
+              response = retryWithoutSp;
+            }
+          } else if (errText.includes('parent') || errText.includes('hierarchy')) {
             console.warn(`[Jira Parent Epic] Could not set parent ${actionItem.epicKey}, retrying without parent:`, errText);
             const retryWithoutParent = await fetch(`https://${domain}/rest/api/3/issue`, {
               method: 'POST',
@@ -2221,7 +1699,7 @@ app.post('/api/jira/create-issue', async (req: Request, res: Response) => {
                 'Content-Type': 'application/json',
                 'Accept': 'application/json'
               },
-              body: JSON.stringify(buildJiraPayload(resolvedIssueTypeName, true, false)),
+              body: JSON.stringify(buildJiraPayload(resolvedIssueTypeName, true, false, true)),
             });
             if (retryWithoutParent.ok) {
               response = retryWithoutParent;
@@ -2235,7 +1713,7 @@ app.post('/api/jira/create-issue', async (req: Request, res: Response) => {
                 'Content-Type': 'application/json',
                 'Accept': 'application/json'
               },
-              body: JSON.stringify(buildJiraPayload(resolvedIssueTypeName, false, false)),
+              body: JSON.stringify(buildJiraPayload(resolvedIssueTypeName, false, false, true)),
             });
             if (retryUnassigned.ok) {
               response = retryUnassigned;
@@ -2249,7 +1727,7 @@ app.post('/api/jira/create-issue', async (req: Request, res: Response) => {
                 'Content-Type': 'application/json',
                 'Accept': 'application/json'
               },
-              body: JSON.stringify(buildJiraPayload(alternateType, true, false)),
+              body: JSON.stringify(buildJiraPayload(alternateType, true, false, false)),
             });
             if (retryRes.ok) {
               response = retryRes;
@@ -2796,12 +2274,37 @@ app.post('/api/jira/sync-statuses', async (req: Request, res: Response) => {
 // Endpoint: Confluence / SharePoint Publishing
 app.post('/api/confluence/publish', async (req: Request, res: Response) => {
   try {
-    const { pageTitle, meetingTitle, meetingDate, contentHtml, spaceKey = 'DEV' } = req.body;
+    const { pageTitle, meetingTitle, meetingDate, contentHtml, spaceKey = 'DEV', parentPageId, jiraConfig } = req.body;
+
+    const title = pageTitle || `Acta de Reunión: ${meetingTitle || 'Sincronización'} - ${meetingDate || new Date().toISOString().split('T')[0]}`;
+    const cleanSpace = (spaceKey || jiraConfig?.confluenceSpace || 'DEV').toUpperCase();
+
+    const isLive = jiraConfig?.simulationMode === false && jiraConfig?.domain && jiraConfig?.userEmail && jiraConfig?.apiToken;
+
+    if (isLive) {
+      try {
+        const liveResult = await publishToConfluenceCloud({
+          domain: jiraConfig.domain,
+          userEmail: jiraConfig.userEmail,
+          apiToken: jiraConfig.apiToken,
+          spaceKey: cleanSpace,
+          pageTitle: title,
+          contentHtml: contentHtml || '',
+          parentPageId,
+        });
+        return res.json(liveResult);
+      } catch (cloudErr: any) {
+        console.error('Confluence Cloud publishing error:', cloudErr);
+        return res.status(400).json({
+          success: false,
+          error: cloudErr.message || 'Error al conectar con la API de Confluence Cloud.',
+        });
+      }
+    }
 
     const pageId = String(Math.floor(100000 + Math.random() * 900000));
-    const title = pageTitle || `Acta de Reunión: ${meetingTitle || 'Sincronización'} - ${meetingDate || new Date().toISOString().split('T')[0]}`;
-    const cleanSpace = (spaceKey || 'DEV').toUpperCase();
-    const mockUrl = `https://empresa.atlassian.net/wiki/spaces/${cleanSpace}/pages/${pageId}`;
+    const cleanDomain = (jiraConfig?.domain || 'empresa.atlassian.net').replace(/^https?:\/\//, '').replace(/\/$/, '');
+    const mockUrl = `https://${cleanDomain}/wiki/spaces/${cleanSpace}/pages/${pageId}`;
 
     return res.json({
       success: true,
@@ -2810,7 +2313,7 @@ app.post('/api/confluence/publish', async (req: Request, res: Response) => {
       spaceKey: cleanSpace,
       pageUrl: mockUrl,
       publishedAt: new Date().toISOString(),
-      message: `Acta publicada exitosamente en el espacio Confluence [${cleanSpace}].`,
+      message: `Acta publicada exitosamente en el espacio Confluence [${cleanSpace}] (Modo Simulado).`,
     });
   } catch (err: any) {
     console.error('Error in /api/confluence/publish:', err);

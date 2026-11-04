@@ -34,13 +34,25 @@ import {
   saveProjectSettings,
   loadMonthlyReports,
   saveMonthlyReport,
-  deleteMonthlyReport
+  deleteMonthlyReport,
+  saveActiveMeetingSession,
+  loadActiveMeetingSession,
+  matchClosestCategory,
+  normalizeCategoryText
 } from './utils/storage';
 import { CheckCircle2, AlertCircle, Info, X, AlertTriangle } from 'lucide-react';
 
 export default function App() {
+  const initialSessionRef = useRef(loadActiveMeetingSession());
+
   // Navigation
-  const [activeTab, setActiveTab] = useState<'transcript' | 'summary' | 'meetings' | 'history' | 'monthly'>('transcript');
+  const [activeTab, setActiveTab] = useState<'transcript' | 'summary' | 'meetings' | 'history' | 'monthly'>(() => {
+    const tab = initialSessionRef.current.activeTab;
+    if (tab && ['transcript', 'summary', 'meetings', 'history', 'monthly'].includes(tab)) {
+      return tab as any;
+    }
+    return 'transcript';
+  });
 
   // Input states (clean start, no sample data)
   const [transcript, setTranscript] = useState<string>('');
@@ -53,7 +65,12 @@ export default function App() {
   const [projectSettings, setProjectSettings] = useState<ProjectSettings>(loadProjectSettings());
   const jiraConfig = projectSettings.jira;
 
-  const [activeMeeting, setActiveMeeting] = useState<MeetingAnalysis | null>(null);
+  const [activeMeeting, setActiveMeetingState] = useState<MeetingAnalysis | null>(null);
+  const activeMeetingRef = useRef<MeetingAnalysis | null>(null);
+  const setActiveMeeting = (meeting: MeetingAnalysis | null) => {
+    activeMeetingRef.current = meeting;
+    setActiveMeetingState(meeting);
+  };
   const [savedMeetingsList, setSavedMeetingsList] = useState<MeetingAnalysis[]>([]);
   const [savedMeetingStatus, setSavedMeetingStatus] = useState(false);
   const [topicsHistory, setTopicsHistory] = useState<TopicHistoryRecord[]>([]);
@@ -101,6 +118,15 @@ export default function App() {
     const loadedMeetings = loadSavedMeetings();
     setSavedMeetingsList(loadedMeetings);
 
+    // Restore active meeting session across page refreshes (F5)
+    if (initialSessionRef.current.activeMeetingId && loadedMeetings.length > 0) {
+      const restored = loadedMeetings.find((m) => m.id === initialSessionRef.current.activeMeetingId);
+      if (restored) {
+        setActiveMeeting(restored);
+        setSavedMeetingStatus(true);
+      }
+    }
+
     const loadedReports = loadMonthlyReports();
     setMonthlyReports(loadedReports);
     if (loadedReports.length > 0) {
@@ -118,6 +144,11 @@ export default function App() {
       window.removeEventListener('teams2jira_local_storage_updated', handleStorageUpdated);
     };
   }, []);
+
+  // Persist current active meeting and active tab for resilient page refresh (F5)
+  useEffect(() => {
+    saveActiveMeetingSession(activeMeeting?.id || null, activeTab);
+  }, [activeMeeting?.id, activeTab]);
 
   // Handler: Analyze Transcript with Server-Side Gemini API
   const handleAnalyzeTranscript = async () => {
@@ -151,6 +182,7 @@ export default function App() {
           },
           jiraConfig,
           jiraUsers: projectSettings.jiraUsers,
+          topicCategories: projectSettings.topicCategories,
           existingTopics: (loadTopicHistory() || []).map((t) => ({
             id: t.id,
             topicName: t.topicName,
@@ -347,7 +379,7 @@ export default function App() {
         updated.unshift({
           id: 'topic-' + Date.now() + '-' + Math.random().toString(36).substring(2, 6),
           topicName: top.topicName,
-          category: top.category || 'General',
+          category: matchClosestCategory(top.category, projectSettings.topicCategories),
           firstDiscussedDate: meeting.meetingDate,
           lastDiscussedDate: meeting.meetingDate,
           meetings: [
@@ -418,7 +450,7 @@ export default function App() {
       const newTopicRecord: TopicHistoryRecord = {
         id: 'topic-' + Date.now() + '-' + Math.random().toString(36).substring(2, 6),
         topicName: cleanTopic,
-        category: category || 'General',
+        category: matchClosestCategory(category || 'General', projectSettings.topicCategories),
         firstDiscussedDate: meetingDateStr,
         lastDiscussedDate: meetingDateStr,
         meetings: [
@@ -456,7 +488,7 @@ export default function App() {
             {
               id: 'top-' + Date.now(),
               topicName: cleanTopic,
-              category: category || 'General',
+              category: matchClosestCategory(category || 'General', projectSettings.topicCategories),
               discussionSummary: `Tema registrado durante el desglose de tareas de la sesión.`,
               status: 'En Progreso',
               riskLevel: 'Bajo',
@@ -480,7 +512,8 @@ export default function App() {
 
   // Handler: Sync Single Action Item to Jira
   const handleSyncSingleItem = async (item: ActionItem, options?: CloneTaskOptions) => {
-    if (!activeMeeting) return;
+    const currentMeeting = activeMeetingRef.current || activeMeeting;
+    if (!currentMeeting) return;
 
     try {
       const res = await fetch('/api/jira/create-issue', {
@@ -498,8 +531,11 @@ export default function App() {
         throw new Error(data.error || 'Error al crear el issue en Jira.');
       }
 
-      // Update item in activeMeeting
-      const updatedActionItems = activeMeeting.actionItems.map((act) => {
+      // Always resolve latest meeting to prevent stale closure during batch syncs
+      const baseMeeting = activeMeetingRef.current || currentMeeting;
+
+      // Update item in meeting
+      const updatedActionItems = baseMeeting.actionItems.map((act) => {
         if (act.id === item.id) {
           return {
             ...act,
@@ -513,7 +549,7 @@ export default function App() {
         return act;
       });
 
-      let updatedMeeting: MeetingAnalysis = { ...activeMeeting, actionItems: updatedActionItems };
+      let updatedMeeting: MeetingAnalysis = { ...baseMeeting, actionItems: updatedActionItems };
       updatedMeeting =
         ensureTopicRegistered(item.topicName, options?.newTopicCategory, data.issueKey, item.assignee, updatedMeeting) ||
         updatedMeeting;
@@ -759,8 +795,13 @@ export default function App() {
 
   // Handler: Batch sync all unsynced items
   const handleBatchSyncAll = async () => {
-    if (!activeMeeting) return;
-    const unsynced = activeMeeting.actionItems.filter((i) => i.jiraStatus !== 'synced');
+    const currentMeeting = activeMeetingRef.current || activeMeeting;
+    if (!currentMeeting) return;
+
+    // Filter strictly only new, unsynced tasks (omit already existing or matched tickets)
+    const unsynced = currentMeeting.actionItems.filter(
+      (i) => i.jiraStatus !== 'synced' && i.taskKind !== 'existing' && !i.matchedJiraKey
+    );
     if (unsynced.length === 0) {
       showToast('info', 'Todos los tickets ya se encuentran sincronizados con Jira.');
       return;
@@ -806,10 +847,6 @@ export default function App() {
       ...topicsHistory.map((t) => t.topicName),
     ].map((s) => (s || '').trim()).filter(Boolean))
   );
-
-  // Latest active meeting, readable from async callbacks without stale closures
-  const activeMeetingRef = useRef<MeetingAnalysis | null>(null);
-  activeMeetingRef.current = activeMeeting;
 
   // Core: pull the current state of the meeting's Jira tickets and merge it into the app
   const syncStatusesFromJira = async (meeting: MeetingAnalysis, silent = false) => {
@@ -1102,7 +1139,9 @@ export default function App() {
     const updated = loadSavedMeetings();
     setSavedMeetingsList(updated);
     if (activeMeeting?.id === meetingId) {
+      setActiveMeeting(null);
       setSavedMeetingStatus(false);
+      saveActiveMeetingSession(null, 'transcript');
     }
     showToast('info', 'Reunión eliminada del histórico.');
   };
@@ -1299,66 +1338,6 @@ export default function App() {
         topicsCount={topicsHistory.length}
         meetingsCount={savedMeetingsList.length}
       />
-
-      {/* AI Model Error Popup */}
-      {aiErrorDialog && (
-        <div
-          className="fixed inset-0 z-[60] flex items-center justify-center bg-black/70 backdrop-blur-xs p-4"
-          role="alertdialog"
-          aria-modal="true"
-          aria-labelledby="ai-error-title"
-          onClick={() => setAiErrorDialog(null)}
-        >
-          <div
-            className="bg-[#1C1E20] border border-[#FF5038]/50 rounded-2xl w-full max-w-md shadow-2xl overflow-hidden animate-in fade-in duration-200 font-['Montserrat']"
-            onClick={(e) => e.stopPropagation()}
-          >
-            <div className="flex items-center gap-3 px-5 py-4 border-b border-[#2E3135] bg-[#291717]">
-              <AlertTriangle className="w-5 h-5 text-[#FF5038] shrink-0" />
-              <h2 id="ai-error-title" className="text-sm font-bold text-white font-['Lato'] flex-1">
-                El modelo de IA devolvió un error
-              </h2>
-              <button
-                id="ai-error-close-x"
-                onClick={() => setAiErrorDialog(null)}
-                className="text-slate-400 hover:text-white p-1 rounded-lg hover:bg-[#25282B]"
-              >
-                <X className="w-4 h-4" />
-              </button>
-            </div>
-            <div className="p-5 space-y-3 text-xs">
-              <div className="flex flex-wrap items-center gap-2">
-                <span className="px-2 py-0.5 rounded-md bg-[#141517] border border-[#3E4247] text-slate-300 font-mono uppercase">
-                  {aiErrorDialog.provider}
-                </span>
-                <span className="px-2 py-0.5 rounded-md bg-[#141517] border border-[#3E4247] text-slate-300 font-mono">
-                  {aiErrorDialog.model}
-                </span>
-                {aiErrorDialog.status !== null && (
-                  <span className="px-2 py-0.5 rounded-md bg-[#FF5038]/15 border border-[#FF5038]/40 text-[#FF5038] font-mono font-bold">
-                    Error {aiErrorDialog.status}
-                  </span>
-                )}
-              </div>
-              <p className="text-slate-200 leading-relaxed bg-[#141517] border border-[#2A2C2F] rounded-xl p-3 break-words">
-                {aiErrorDialog.message}
-              </p>
-              <p className="text-[11px] text-slate-400">
-                No se ha generado ningún análisis. Inténtalo de nuevo más tarde o cambia de modelo en la pestaña de carga.
-              </p>
-            </div>
-            <div className="flex justify-end px-5 py-3 border-t border-[#2E3135] bg-[#141517]">
-              <button
-                id="ai-error-close"
-                onClick={() => setAiErrorDialog(null)}
-                className="px-4 py-2 rounded-xl bg-gradient-to-r from-[#FF5038] to-[#EE880E] text-white text-xs font-bold cursor-pointer"
-              >
-                Entendido
-              </button>
-            </div>
-          </div>
-        </div>
-      )}
 
       {/* Toast Notification Banner */}
       {notification && (

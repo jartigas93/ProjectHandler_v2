@@ -193,11 +193,15 @@ export async function linkJiraIssuesInCloud(
     let outwardKey = newIssueKey;
 
     if (relationType === 'is_blocked_by') {
-      inwardKey = sourceIssueKey;
-      outwardKey = newIssueKey;
-    } else if (relationType === 'blocks') {
+      // newIssueKey is blocked by sourceIssueKey
+      // outward = blocker (sourceIssueKey), inward = blocked (newIssueKey)
       inwardKey = newIssueKey;
       outwardKey = sourceIssueKey;
+    } else if (relationType === 'blocks') {
+      // newIssueKey blocks sourceIssueKey
+      // outward = blocker (newIssueKey), inward = blocked (sourceIssueKey)
+      inwardKey = sourceIssueKey;
+      outwardKey = newIssueKey;
     } else {
       inwardKey = newIssueKey;
       outwardKey = sourceIssueKey;

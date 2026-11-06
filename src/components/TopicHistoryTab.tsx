@@ -120,7 +120,8 @@ export const TopicHistoryTab: React.FC<TopicHistoryTabProps> = ({
     const matchesCategory =
       categoryFilter === 'all' ||
       t.category === categoryFilter ||
-      normalizeCategoryText(t.category) === normalizeCategoryText(categoryFilter);
+      normalizeCategoryText(t.category) === normalizeCategoryText(categoryFilter) ||
+      matchClosestCategory(t.category, effectiveCategories) === categoryFilter;
     return matchesSearch && matchesStatus && matchesCategory;
   });
 

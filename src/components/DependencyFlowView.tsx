@@ -1,17 +1,21 @@
 import React from 'react';
 import { TaskDependency, ActionItem } from '../types';
-import { ArrowRight, CheckCircle2, Clock, GitCommit, User } from 'lucide-react';
+import { ArrowRight, CheckCircle2, Clock, GitCommit, Link2, Loader2, User } from 'lucide-react';
 
 interface DependencyFlowViewProps {
   dependencies: TaskDependency[];
   actionItems: ActionItem[];
   onOpenTicketDetails: (item: ActionItem) => void;
+  onLinkDependency?: (dep: TaskDependency) => Promise<void>;
+  isLinkingId?: string | null;
 }
 
 export const DependencyFlowView: React.FC<DependencyFlowViewProps> = ({
   dependencies,
   actionItems,
   onOpenTicketDetails,
+  onLinkDependency,
+  isLinkingId,
 }) => {
   if (!dependencies || dependencies.length === 0) {
     return (
@@ -43,66 +47,115 @@ export const DependencyFlowView: React.FC<DependencyFlowViewProps> = ({
 
         <div className="space-y-3 pt-2">
           {dependencies.map((dep, idx) => {
-            const blockerItem = actionItems.find((a) => a.id === dep.blockerTaskId);
-            const blockedItem = actionItems.find((a) => a.id === dep.blockedTaskId);
+            const blockerItem = actionItems.find(
+              (a) => a.id === dep.blockerTaskId || a.title?.trim().toLowerCase() === dep.blockerTitle?.trim().toLowerCase()
+            );
+            const blockedItem = actionItems.find(
+              (a) => a.id === dep.blockedTaskId || a.title?.trim().toLowerCase() === dep.blockedTitle?.trim().toLowerCase()
+            );
+
+            const blockerKey = blockerItem?.jiraTicketKey || blockerItem?.matchedJiraKey;
+            const blockedKey = blockedItem?.jiraTicketKey || blockedItem?.matchedJiraKey;
+            const canLink = Boolean(blockerKey && blockedKey && blockerKey !== blockedKey);
+            const depKeyId = dep.id || `dep-${idx}`;
+            const isCurrentlyLinking = isLinkingId === depKeyId || isLinkingId === `${blockerKey}-${blockedKey}`;
 
             return (
               <div
                 key={dep.id || idx}
-                className="bg-[#141517] border border-[#2A2C2F] rounded-xl p-4 flex flex-col md:flex-row items-stretch md:items-center justify-between gap-4 hover:border-[#FF5038]/40 transition-colors"
+                className="bg-[#141517] border border-[#2A2C2F] rounded-xl p-4 space-y-3 hover:border-[#FF5038]/40 transition-colors"
               >
-                {/* Blocker Node (Must complete first) */}
-                <div
-                  onClick={() => blockerItem && onOpenTicketDetails(blockerItem)}
-                  className="flex-1 bg-[#1C1E20] p-3 rounded-lg border border-[#3E4247] cursor-pointer hover:border-[#FF5038] transition-colors"
-                >
-                  <div className="flex items-center justify-between text-[11px] mb-1">
-                    <span className="font-bold text-[#FF5038] flex items-center gap-1">
-                      <Clock className="w-3 h-3" /> Debe culminar primero
-                    </span>
-                    <span className="text-slate-400 font-mono text-[10px]">
-                      {blockerItem?.jiraTicketKey || 'En Progreso'}
+                <div className="flex flex-col md:flex-row items-stretch md:items-center justify-between gap-4">
+                  {/* Blocker Node (Must complete first) */}
+                  <div
+                    onClick={() => blockerItem && onOpenTicketDetails(blockerItem)}
+                    className="flex-1 bg-[#1C1E20] p-3 rounded-lg border border-[#3E4247] cursor-pointer hover:border-[#FF5038] transition-colors"
+                  >
+                    <div className="flex items-center justify-between text-[11px] mb-1">
+                      <span className="font-bold text-[#FF5038] flex items-center gap-1">
+                        <Clock className="w-3 h-3" /> Debe culminar primero
+                      </span>
+                      <span className="text-slate-400 font-mono text-[10px]">
+                        {blockerKey || 'En Progreso'}
+                      </span>
+                    </div>
+                    <h4 className="text-xs font-bold text-white truncate max-w-[280px]">
+                      {dep.blockerTitle}
+                    </h4>
+                    <div className="flex items-center gap-1.5 mt-2 text-[11px] text-slate-300">
+                      <User className="w-3 h-3 text-[#EE880E]" />
+                      <span className="font-semibold">{dep.blockerAssignee}</span>
+                    </div>
+                  </div>
+
+                  {/* Arrow & Relation Description */}
+                  <div className="flex flex-col items-center justify-center px-2 py-1 text-center shrink-0">
+                    <div className="hidden md:flex items-center justify-center w-8 h-8 rounded-full bg-[#FF5038]/10 text-[#FF5038] border border-[#FF5038]/30">
+                      <ArrowRight className="w-4 h-4" />
+                    </div>
+                    <span className="text-[11px] text-slate-400 font-medium max-w-[200px] mt-1 leading-tight">
+                      {dep.description}
                     </span>
                   </div>
-                  <h4 className="text-xs font-bold text-white truncate max-w-[280px]">
-                    {dep.blockerTitle}
-                  </h4>
-                  <div className="flex items-center gap-1.5 mt-2 text-[11px] text-slate-300">
-                    <User className="w-3 h-3 text-[#EE880E]" />
-                    <span className="font-semibold">{dep.blockerAssignee}</span>
+
+                  {/* Blocked Node (Can only proceed after) */}
+                  <div
+                    onClick={() => blockedItem && onOpenTicketDetails(blockedItem)}
+                    className="flex-1 bg-[#1C1E20] p-3 rounded-lg border border-[#3E4247] cursor-pointer hover:border-[#61BFED] transition-colors"
+                  >
+                    <div className="flex items-center justify-between text-[11px] mb-1">
+                      <span className="font-bold text-[#61BFED] flex items-center gap-1">
+                        <CheckCircle2 className="w-3 h-3" /> Espera este entregable
+                      </span>
+                      <span className="text-slate-400 font-mono text-[10px]">
+                        {blockedKey || 'Bloqueado / Pendiente'}
+                      </span>
+                    </div>
+                    <h4 className="text-xs font-bold text-white truncate max-w-[280px]">
+                      {dep.blockedTitle}
+                    </h4>
+                    <div className="flex items-center gap-1.5 mt-2 text-[11px] text-slate-300">
+                      <User className="w-3 h-3 text-[#61BFED]" />
+                      <span className="font-semibold">{dep.blockedAssignee}</span>
+                    </div>
                   </div>
                 </div>
 
-                {/* Arrow & Relation Description */}
-                <div className="flex flex-col items-center justify-center px-2 py-1 text-center shrink-0">
-                  <div className="hidden md:flex items-center justify-center w-8 h-8 rounded-full bg-[#FF5038]/10 text-[#FF5038] border border-[#FF5038]/30">
-                    <ArrowRight className="w-4 h-4" />
+                {/* Jira Cloud Issue Link Action Row */}
+                <div className="pt-2 border-t border-[#2A2C2F] flex flex-col sm:flex-row items-start sm:items-center justify-between gap-2 text-xs">
+                  <div className="flex items-center gap-1.5 text-slate-400 text-[11px]">
+                    <Link2 className="w-3.5 h-3.5 text-[#EE880E]" />
+                    <span>Vinculación en Jira:</span>
+                    {canLink ? (
+                      <span className="text-slate-200 font-mono font-medium">
+                        {blockerKey} &rarr; Bloquea a &rarr; {blockedKey}
+                      </span>
+                    ) : (
+                      <span className="text-slate-400 italic">
+                        {blockerKey ? `Falta sincronizar ticket dependiente` : `Faltan crear tickets en Jira`}
+                      </span>
+                    )}
                   </div>
-                  <span className="text-[11px] text-slate-400 font-medium max-w-[200px] mt-1 leading-tight">
-                    {dep.description}
-                  </span>
-                </div>
 
-                {/* Blocked Node (Can only proceed after) */}
-                <div
-                  onClick={() => blockedItem && onOpenTicketDetails(blockedItem)}
-                  className="flex-1 bg-[#1C1E20] p-3 rounded-lg border border-[#3E4247] cursor-pointer hover:border-[#61BFED] transition-colors"
-                >
-                  <div className="flex items-center justify-between text-[11px] mb-1">
-                    <span className="font-bold text-[#61BFED] flex items-center gap-1">
-                      <CheckCircle2 className="w-3 h-3" /> Espera este entregable
-                    </span>
-                    <span className="text-slate-400 font-mono text-[10px]">
-                      {blockedItem?.jiraTicketKey || 'Bloqueado / Pendiente'}
-                    </span>
-                  </div>
-                  <h4 className="text-xs font-bold text-white truncate max-w-[280px]">
-                    {dep.blockedTitle}
-                  </h4>
-                  <div className="flex items-center gap-1.5 mt-2 text-[11px] text-slate-300">
-                    <User className="w-3 h-3 text-[#61BFED]" />
-                    <span className="font-semibold">{dep.blockedAssignee}</span>
-                  </div>
+                  {onLinkDependency && canLink && (
+                    <button
+                      onClick={() => onLinkDependency(dep)}
+                      disabled={isCurrentlyLinking}
+                      className="px-3 py-1 bg-[#241F18] hover:bg-[#34281B] text-[#EE880E] border border-[#EE880E]/40 hover:border-[#EE880E] rounded-lg text-xs font-semibold transition-all flex items-center gap-1.5 shadow-xs disabled:opacity-50 disabled:cursor-not-allowed cursor-pointer"
+                    >
+                      {isCurrentlyLinking ? (
+                        <>
+                          <Loader2 className="w-3 h-3 animate-spin text-[#EE880E]" />
+                          <span>Vinculando en Jira Cloud...</span>
+                        </>
+                      ) : (
+                        <>
+                          <Link2 className="w-3 h-3" />
+                          <span>Vincular dependencia en Jira Cloud</span>
+                        </>
+                      )}
+                    </button>
+                  )}
                 </div>
               </div>
             );

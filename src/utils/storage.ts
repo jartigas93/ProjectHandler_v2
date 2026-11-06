@@ -68,12 +68,13 @@ export const DEFAULT_JIRA_USERS: JiraUser[] = [
 
 export const DEFAULT_TOPIC_CATEGORIES: string[] = [
   'Backend & APIs',
-  'Frontend & UX',
   'DevOps & Cloud',
   'Arquitectura & Datos',
   'Seguridad & Compliance',
   'QA & Automatización',
   'Gestión & Producto',
+  'Reingenieria',
+  'IA',
 ];
 
 export function normalizeCategoryText(text: string): string {
@@ -129,7 +130,7 @@ export function matchClosestCategory(rawCategory: string, availableCategories: s
       normCat.includes('reingenieria')
     ) score += 10;
     if (
-      (normRaw.includes('ia') || normRaw.includes('inteligencia') || normRaw.includes('ml')) &&
+      (normRaw.includes('ia') || normRaw.includes('inteligencia') || normRaw.includes('ml') || normRaw.includes('ai')) &&
       normCat.includes('ia')
     ) score += 10;
     if (
@@ -139,6 +140,18 @@ export function matchClosestCategory(rawCategory: string, availableCategories: s
     if (
       (normRaw.includes('frontend') || normRaw.includes('ui') || normRaw.includes('ux') || normRaw.includes('interfaz')) &&
       normCat.includes('frontend')
+    ) score += 10;
+    if (
+      (normRaw.includes('gestion') || normRaw.includes('producto') || normRaw.includes('general') || normRaw.includes('coordinacion')) &&
+      (normCat.includes('gestion') || normCat.includes('producto'))
+    ) score += 10;
+    if (
+      (normRaw.includes('seguridad') || normRaw.includes('compliance') || normRaw.includes('soc2') || normRaw.includes('auditoria')) &&
+      normCat.includes('seguridad')
+    ) score += 10;
+    if (
+      (normRaw.includes('datos') || normRaw.includes('data') || normRaw.includes('bi') || normRaw.includes('modelado')) &&
+      normCat.includes('datos')
     ) score += 10;
 
     if (score > bestScore) {
@@ -459,7 +472,39 @@ export function loadTopicHistory(): TopicHistoryRecord[] {
     const data = localStorage.getItem(STORAGE_KEYS.TOPICS);
     if (!data) return [];
     const topics: TopicHistoryRecord[] = JSON.parse(data);
-    return topics.filter((t) => !SEED_TOPIC_IDS.has(t.id));
+    const validTopics = topics.filter((t) => !SEED_TOPIC_IDS.has(t.id));
+
+    // Get current configured categories
+    let configuredCategories = DEFAULT_TOPIC_CATEGORIES;
+    try {
+      const settingsStr = localStorage.getItem(STORAGE_KEYS.PROJECT_SETTINGS);
+      if (settingsStr) {
+        const parsed = JSON.parse(settingsStr);
+        if (Array.isArray(parsed.topicCategories) && parsed.topicCategories.length > 0) {
+          configuredCategories = parsed.topicCategories;
+        }
+      }
+    } catch {
+      // fallback
+    }
+
+    let needsResave = false;
+    const normalizedTopics = validTopics.map((t) => {
+      if (!configuredCategories.includes(t.category)) {
+        const closest = matchClosestCategory(t.category, configuredCategories);
+        if (closest !== t.category) {
+          needsResave = true;
+          return { ...t, category: closest, updatedAt: t.updatedAt || new Date().toISOString() };
+        }
+      }
+      return t;
+    });
+
+    if (needsResave) {
+      localStorage.setItem(STORAGE_KEYS.TOPICS, JSON.stringify(normalizedTopics));
+    }
+
+    return normalizedTopics;
   } catch (e) {
     console.error('Error loading topic history:', e);
     return [];
@@ -489,16 +534,35 @@ export function clearTopicHistory(): void {
 }
 
 export function updateOrAddTopic(topic: TopicHistoryRecord): void {
+  let configuredCategories = DEFAULT_TOPIC_CATEGORIES;
+  try {
+    const settingsStr = localStorage.getItem(STORAGE_KEYS.PROJECT_SETTINGS);
+    if (settingsStr) {
+      const parsed = JSON.parse(settingsStr);
+      if (Array.isArray(parsed.topicCategories) && parsed.topicCategories.length > 0) {
+        configuredCategories = parsed.topicCategories;
+      }
+    }
+  } catch {
+    // fallback
+  }
+
+  const normalizedCategory = matchClosestCategory(topic.category, configuredCategories);
+  const normalizedTopic: TopicHistoryRecord = {
+    ...topic,
+    category: normalizedCategory,
+    updatedAt: new Date().toISOString(),
+  };
+
   const topics = loadTopicHistory();
-  const index = topics.findIndex((t) => t.id === topic.id || t.topicName.toLowerCase() === topic.topicName.toLowerCase());
+  const index = topics.findIndex((t) => t.id === normalizedTopic.id || t.topicName.toLowerCase() === normalizedTopic.topicName.toLowerCase());
   if (index >= 0) {
     topics[index] = {
       ...topics[index],
-      ...topic,
-      updatedAt: new Date().toISOString(),
+      ...normalizedTopic,
     };
   } else {
-    topics.unshift(topic);
+    topics.unshift(normalizedTopic);
   }
   saveTopicHistory(topics);
 }

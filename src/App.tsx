@@ -83,6 +83,7 @@ export default function App() {
   const [isBatchSyncing, setIsBatchSyncing] = useState(false);
   const [isGeneratingReport, setIsGeneratingReport] = useState(false);
   const [isSyncingStatuses, setIsSyncingStatuses] = useState(false);
+  const [isLinkingDependencyId, setIsLinkingDependencyId] = useState<string | null>(null);
 
   // Modals
   const [isSettingsOpen, setIsSettingsOpen] = useState(false);
@@ -510,6 +511,58 @@ export default function App() {
     showToast('success', 'Todos los temas y compromisos se guardaron en el histórico.');
   };
 
+  // Handler: Link a detected dependency natively in Jira Cloud
+  const handleLinkDependencyInJira = async (dep: TaskDependency, silent = false) => {
+    const currentMeeting = activeMeetingRef.current || activeMeeting;
+    if (!currentMeeting) return;
+
+    const blockerItem = currentMeeting.actionItems.find(
+      (a) => a.id === dep.blockerTaskId || a.title?.trim().toLowerCase() === dep.blockerTitle?.trim().toLowerCase()
+    );
+    const blockedItem = currentMeeting.actionItems.find(
+      (a) => a.id === dep.blockedTaskId || a.title?.trim().toLowerCase() === dep.blockedTitle?.trim().toLowerCase()
+    );
+
+    const blockerKey = blockerItem?.jiraTicketKey || blockerItem?.matchedJiraKey;
+    const blockedKey = blockedItem?.jiraTicketKey || blockedItem?.matchedJiraKey;
+
+    if (!blockerKey || !blockedKey || blockerKey === blockedKey) {
+      if (!silent) {
+        showToast('error', 'Ambos tickets deben estar sincronizados en Jira Cloud para poder vincularlos.');
+      }
+      return;
+    }
+
+    const depId = dep.id || `${blockerKey}-${blockedKey}`;
+    setIsLinkingDependencyId(depId);
+    try {
+      const res = await fetch('/api/jira/link-issues', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          blockerKey,
+          blockedKey,
+          relationType: 'blocks',
+          jiraConfig,
+        }),
+      });
+
+      const data = await res.json();
+      if (!res.ok || !data.success) {
+        throw new Error(data.error || 'No se pudo vincular la dependencia en Jira Cloud.');
+      }
+
+      showToast('success', `¡Dependencia vinculada en Jira! ${blockerKey} bloquea a ${blockedKey}`);
+    } catch (err: any) {
+      console.error('Error linking dependency in Jira:', err);
+      if (!silent) {
+        showToast('error', err.message || 'Error al conectar con Jira Cloud.');
+      }
+    } finally {
+      setIsLinkingDependencyId(null);
+    }
+  };
+
   // Handler: Sync Single Action Item to Jira
   const handleSyncSingleItem = async (item: ActionItem, options?: CloneTaskOptions) => {
     const currentMeeting = activeMeetingRef.current || activeMeeting;
@@ -556,6 +609,31 @@ export default function App() {
 
       setActiveMeeting(updatedMeeting);
       saveMeeting(updatedMeeting);
+
+      // Auto-link any dependency in meeting if both blocker and blocked items are now synced
+      if (Array.isArray(updatedMeeting.dependencies) && updatedMeeting.dependencies.length > 0) {
+        for (const dep of updatedMeeting.dependencies) {
+          const isRelated =
+            dep.blockerTaskId === item.id ||
+            dep.blockedTaskId === item.id ||
+            dep.blockerTitle?.trim().toLowerCase() === item.title.trim().toLowerCase() ||
+            dep.blockedTitle?.trim().toLowerCase() === item.title.trim().toLowerCase();
+          if (!isRelated) continue;
+
+          const bItem = updatedMeeting.actionItems.find(
+            (a) => a.id === dep.blockerTaskId || a.title?.trim().toLowerCase() === dep.blockerTitle?.trim().toLowerCase()
+          );
+          const dItem = updatedMeeting.actionItems.find(
+            (a) => a.id === dep.blockedTaskId || a.title?.trim().toLowerCase() === dep.blockedTitle?.trim().toLowerCase()
+          );
+          const bKey = bItem?.jiraTicketKey || bItem?.matchedJiraKey;
+          const dKey = dItem?.jiraTicketKey || dItem?.matchedJiraKey;
+
+          if (bKey && dKey && bKey !== dKey) {
+            handleLinkDependencyInJira(dep, true).catch(() => {});
+          }
+        }
+      }
 
       showToast(
         'success',
@@ -814,6 +892,25 @@ export default function App() {
         await handleSyncSingleItem(item);
         successCount++;
       }
+
+      // Automatically link all dependencies in meeting once batch creation finishes
+      const finalMeeting = activeMeetingRef.current || activeMeeting;
+      if (Array.isArray(finalMeeting?.dependencies) && finalMeeting.dependencies.length > 0) {
+        for (const dep of finalMeeting.dependencies) {
+          const bItem = finalMeeting.actionItems.find(
+            (a) => a.id === dep.blockerTaskId || a.title?.trim().toLowerCase() === dep.blockerTitle?.trim().toLowerCase()
+          );
+          const dItem = finalMeeting.actionItems.find(
+            (a) => a.id === dep.blockedTaskId || a.title?.trim().toLowerCase() === dep.blockedTitle?.trim().toLowerCase()
+          );
+          const bKey = bItem?.jiraTicketKey || bItem?.matchedJiraKey;
+          const dKey = dItem?.jiraTicketKey || dItem?.matchedJiraKey;
+          if (bKey && dKey && bKey !== dKey) {
+            await handleLinkDependencyInJira(dep, true);
+          }
+        }
+      }
+
       showToast('success', `¡Sincronización completa! Se crearon ${successCount} tickets en Jira.`);
     } catch (err: any) {
       showToast('error', `Sincronización parcial: ${err.message}`);
@@ -1417,6 +1514,8 @@ export default function App() {
             onAssignOrphan={handleAssignOrphan}
             onAddComment={handleAddCommentToJira}
             onToggleTaskKind={handleToggleTaskKind}
+            onLinkDependency={handleLinkDependencyInJira}
+            isLinkingDependencyId={isLinkingDependencyId}
           />
         )}
 

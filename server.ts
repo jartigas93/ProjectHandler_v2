@@ -1818,6 +1818,57 @@ app.post('/api/jira/create-issue', async (req: Request, res: Response) => {
   }
 });
 
+// Endpoint: Link two Jira Issues (Blocks / Is blocked by / Relates)
+app.post('/api/jira/link-issues', async (req: Request, res: Response) => {
+  try {
+    const { blockerKey, blockedKey, relationType = 'blocks', jiraConfig } = req.body;
+
+    if (!blockerKey || !blockedKey) {
+      return res.status(400).json({ error: 'Faltan las claves de los tickets (blockerKey y blockedKey).' });
+    }
+
+    const domain = (jiraConfig?.domain || 'civicasoftware.atlassian.net').trim().replace(/^https?:\/\//, '').replace(/\/$/, '');
+    const isLiveJira = jiraConfig?.simulationMode === false;
+
+    if (!isLiveJira) {
+      return res.json({
+        success: true,
+        mode: 'simulation',
+        message: `[Simulación] Tickets ${blockerKey} y ${blockedKey} vinculados con relación ${relationType}.`,
+      });
+    }
+
+    if (!jiraConfig?.apiToken || !jiraConfig?.userEmail) {
+      return res.status(400).json({
+        success: false,
+        error: 'Falta configurar el Correo o el API Token de Atlassian para vincular tickets en Jira Cloud.',
+      });
+    }
+
+    const authHeader = 'Basic ' + Buffer.from(`${jiraConfig.userEmail.trim()}:${jiraConfig.apiToken.trim()}`).toString('base64');
+    
+    // newIssueKey: blockerKey, sourceIssueKey: blockedKey, relationType: 'blocks'
+    const result = await linkJiraIssuesInCloud(domain, authHeader, blockerKey, blockedKey, relationType);
+
+    if (!result.linked) {
+      return res.status(400).json({
+        success: false,
+        error: result.warning || 'No se pudo crear la vinculación en Jira Cloud.',
+      });
+    }
+
+    return res.json({
+      success: true,
+      mode: 'live-jira',
+      linkTypeName: result.linkTypeName,
+      message: `Enlace creado en Jira: ${blockerKey} bloquea a ${blockedKey}`,
+    });
+  } catch (error: any) {
+    console.error('Error in /api/jira/link-issues:', error);
+    res.status(500).json({ error: error?.message || 'Error al vincular tickets en Jira.' });
+  }
+});
+
 // Endpoint: Test Jira Connection
 app.post('/api/jira/test-connection', async (req: Request, res: Response) => {
   const { domain, projectKey, userEmail, apiToken, simulationMode } = req.body;

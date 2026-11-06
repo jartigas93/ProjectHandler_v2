@@ -317,6 +317,8 @@ Para mantener las relaciones de bloqueo y precedencia entre las tareas del table
    El backend consulta la API de Jira (`GET /rest/api/3/issueLinkType`) detectando dinámicamente los nombres de enlace tanto en instancias en inglés (*Blocks*, *Relates*, *Cloners*) como en español (*Bloquea*, *Se relaciona con*, *Clonado*).
 3. **Integración con el Grafo de Dependencias:**  
    Si se selecciona una relación de bloqueo (`is_blocked_by` o `blocks`), el sistema crea automáticamente un nodo de dependencia en la reunión activa (`activeMeeting.dependencies`), representándose de inmediato en la vista **Grafo de Dependencias** (`DependencyFlowView`).
+4. **Auto-Vinculación de Dependencias Detectadas por IA y Acción Directa:**  
+   Cuando la IA detecta que dos tareas de la reunión tienen una relación de bloqueo mutuo, el sistema ejecuta automáticamente la llamada de enlace nativo en Jira Cloud (`POST /rest/api/3/issueLink`) en cuanto ambos tickets cuentan con su clave creada (tanto en sincronización individual como por lotes). Adicionalmente, desde la vista **Dependencias** (`DependencyFlowView`), cada relación muestra las claves vinculadas (`ORPDATA-XXX → Bloquea a → ORPDATA-YYY`) e incorpora el botón **"Vincular dependencia en Jira Cloud"** para establecer el enlace formal con un solo clic.
 
 ---
 
@@ -548,6 +550,7 @@ Si el usuario no dispone de credenciales de Jira Cloud o activa el interruptor d
 | `GET` | `/api/jira/board-context` | Obtiene las incidencias abiertas en el tablero para contextualizar el análisis. |
 | `POST` | `/api/jira/epics` | Búsqueda JQL de épicas activas en Jira Cloud para asignación jerárquica de tareas (`Parent Epic`). |
 | `POST` | `/api/jira/create-issue` | Crea una nueva incidencia en Jira Cloud con separación limpia de descripción/contexto, asignación de Épica Padre y vinculación nativa de issues (`Issue Linking`). |
+| `POST` | `/api/jira/link-issues` | Establece una relación formal de bloqueo o vinculación (`Blocks`, `Is blocked by`, `Relates`) entre dos incidencias de Jira Cloud. |
 | `POST` | `/api/jira/update-issue` | Modifica una incidencia existente en Jira Cloud (resumen, descripción, criterios de aceptación, prioridad, responsable, etiquetas y Épica Padre). |
 | `POST` | `/api/jira/add-comment` | Publica o actualiza un comentario en formato ADF con estructura de avance y criterios de aceptación sin duplicados. |
 | `POST` | `/api/jira/sync-statuses` | Recupera el estado actualizado de un listado de claves de Jira. |

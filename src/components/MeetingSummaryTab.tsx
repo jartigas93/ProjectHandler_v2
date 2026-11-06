@@ -38,7 +38,7 @@ import {
   MessageSquare,
   Unlink,
 } from 'lucide-react';
-import { MeetingAnalysis, ActionItem, JiraConfig, OrphanCommitment, Priority, JiraUser, CloneTaskOptions } from '../types';
+import { MeetingAnalysis, ActionItem, JiraConfig, OrphanCommitment, Priority, JiraUser, CloneTaskOptions, TaskDependency } from '../types';
 import { DEFAULT_JIRA_USERS } from '../utils/storage';
 import { formatTeamsMessageSummary } from '../utils/exportUtils';
 import { DependencyFlowView } from './DependencyFlowView';
@@ -68,6 +68,8 @@ interface MeetingSummaryTabProps {
   onBidirectionalSync?: () => Promise<void>;
   isSyncingStatuses?: boolean;
   onAssignOrphan?: (orphan: OrphanCommitment, assigneeName: string) => void;
+  onLinkDependency?: (dep: TaskDependency) => Promise<void>;
+  isLinkingDependencyId?: string | null;
   onAddComment?: (item: ActionItem, customComment?: string) => Promise<void>;
   onToggleTaskKind?: (itemId: string) => void;
 }
@@ -95,6 +97,8 @@ export const MeetingSummaryTab: React.FC<MeetingSummaryTabProps> = ({
   onAssignOrphan,
   onAddComment,
   onToggleTaskKind,
+  onLinkDependency,
+  isLinkingDependencyId,
 }) => {
   const [selectedParticipant, setSelectedParticipant] = useState<string>('all');
   const [searchQuery, setSearchQuery] = useState<string>('');
@@ -703,6 +707,8 @@ export const MeetingSummaryTab: React.FC<MeetingSummaryTabProps> = ({
           dependencies={meeting.dependencies || []}
           actionItems={meeting.actionItems}
           onOpenTicketDetails={onOpenTicketDetails}
+          onLinkDependency={onLinkDependency}
+          isLinkingId={isLinkingDependencyId}
         />
       ) : viewMode === 'raci' ? (
         <RACIMatrixView
